@@ -1,0 +1,9 @@
+# Only the two tools and the README are published; dataset, videos and YOWO stay local
+/*
+!/.gitignore
+!/README.md
+!/frame_extractor/
+!/labeler/
+
+__pycache__/
+*.pyc
