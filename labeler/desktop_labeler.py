@@ -1,17 +1,25 @@
 import os
 import sys
 import copy
+import argparse
 import time
 import subprocess
+import threading
 from collections import OrderedDict
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from PIL import Image
 
 from annotation_io import (
     CLASS_MAP,
     delete_snippet,
+    import_frame_folder,
+    list_image_files,
+    IMPORT_EXTS,
     snippet_paths,
+    is_repo_layout,
+    load_yolo_classes,
+    load_label_names,
     load_dataset_snippets,
     parse_cvat_xml,
     parse_yolo_txt,
@@ -22,6 +30,8 @@ from zoom_canvas import ZoomPanView
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(BASE_DIR)  # archive/ is shared with the frame extractor
+# Datasets looked for next to the tool folders, first one found is opened
+DATASET_DIRS = ("dataset_lifeguard", "archive")
 EXTRACTOR_SCRIPT = os.path.join(PROJECT_DIR, "frame_extractor", "video_frame_extractor.py")
 IMG_EXTS = (".jpg", ".jpeg", ".png")
 CLASS_COLORS = {"swim": "#ff00cc", "drown": "#fafa37"}
@@ -80,7 +90,12 @@ class DesktopFrameLabeler:
         self.setup_styles()
 
         # Dataset state
-        self.archive_dir = archive_dir or os.path.join(PROJECT_DIR, "archive")
+        candidates = [os.path.join(PROJECT_DIR, d) for d in DATASET_DIRS]
+        self.archive_dir = os.path.abspath(archive_dir) if archive_dir else next(
+            (d for d in candidates if os.path.isdir(os.path.join(d, "frames"))), candidates[-1])
+        self.repo_layout = False  # dataset_lifeguard layout: labels are CVAT XML only
+        self.yolo_class_map = dict(CLASS_MAP)  # label -> YOLO class id (from <dataset>/classes.txt)
+        self.label_names = {"swim": "swim", "drown": "drown"}  # label -> name shown / written to XML
         self.snippets = []
         self.filtered_snippets = []
         self.current_tab = "unlabeled"
@@ -114,6 +129,7 @@ class DesktopFrameLabeler:
 
         self._slider_lock = False
         self._timeline_job = None
+        self._import_running = False
 
         self.create_ui()
         self.bind_shortcuts()
@@ -142,9 +158,12 @@ class DesktopFrameLabeler:
         brand_top.pack(fill="x")
         tk.Label(brand_top, text="🛟 Frame Labeler", font=("Inter", 13, "bold"), fg="#f8fafc", bg="#1e293b").pack(side="left")
         tk.Button(brand_top, text="🔄", font=("Inter", 8), bg="#334155", fg="#38bdf8", relief="flat", padx=4, command=self.load_dataset).pack(side="right")
-        tk.Label(brand_frame, text="Lifeguard Drowning Dataset", font=("Inter", 8), fg="#94a3b8", bg="#1e293b").pack(anchor="w")
+        tk.Button(brand_top, text="📁", font=("Inter", 8), bg="#334155", fg="#38bdf8", relief="flat", padx=4, command=self.choose_dataset).pack(side="right", padx=(0, 3))
+        self.dataset_lbl = tk.Label(brand_frame, text="Lifeguard Drowning Dataset", font=("Inter", 8), fg="#94a3b8", bg="#1e293b")
+        self.dataset_lbl.pack(anchor="w")
 
-        tk.Button(sidebar, text="🎬 Tách Frame Từ Video...", font=("Inter", 8, "bold"), bg="#06b6d4", fg="#020617", relief="flat", pady=3, command=self.open_frame_extractor).pack(fill="x", padx=12, pady=(0, 8))
+        tk.Button(sidebar, text="🎬 Tách Frame Từ Video...", font=("Inter", 8, "bold"), bg="#06b6d4", fg="#020617", relief="flat", pady=3, command=self.open_frame_extractor).pack(fill="x", padx=12, pady=(0, 4))
+        tk.Button(sidebar, text="➕ Thêm bộ frame từ thư mục...", font=("Inter", 8, "bold"), bg="#16a34a", fg="#f8fafc", relief="flat", pady=3, command=self.add_frame_folder).pack(fill="x", padx=12, pady=(0, 8))
 
         stats_frame = tk.Frame(sidebar, bg="#0f172a", bd=1, relief="solid")
         stats_frame.pack(fill="x", padx=12, pady=(0, 10))
@@ -338,8 +357,38 @@ class DesktopFrameLabeler:
     # ================================================================== dataset
     def load_dataset(self):
         self.snippets = load_dataset_snippets(self.archive_dir)
+        self.repo_layout = is_repo_layout(self.archive_dir)
+        try:
+            self.yolo_class_map, _ = load_yolo_classes(self.archive_dir)
+            self.label_names = load_label_names(self.archive_dir)
+        except ValueError as ex:
+            self.yolo_class_map = dict(CLASS_MAP)
+            self.label_names = {"swim": "swim", "drown": "drown"}
+            messagebox.showerror("classes.txt", f"{ex}\nDùng thứ tự mặc định 0 = swim, 1 = drown.")
+        self.swim_btn.config(text=f"{self.label_names['swim']} (1)")
+        self.drown_btn.config(text=f"{self.label_names['drown']} (2)")
+        self.update_boxes_listbox()
+        self.dataset_lbl.config(text=f"Dataset: {self.short_path(self.archive_dir)}" + ("  (nhãn XML)" if self.repo_layout else ""))
         self.update_stats()
         self.render_snippet_list()
+
+    def choose_dataset(self):
+        """Switch to another dataset folder (one that contains frames/ and labels/)."""
+        folder = filedialog.askdirectory(parent=self.root, title="Chọn thư mục dataset (chứa frames/)", initialdir=self.archive_dir)
+        if not folder:
+            return
+        folder = os.path.abspath(folder)
+        if os.path.basename(folder) == "frames" and not os.path.isdir(os.path.join(folder, "frames")):
+            folder = os.path.dirname(folder)
+        if not os.path.isdir(os.path.join(folder, "frames")):
+            messagebox.showerror("Chọn dataset", f"Không có thư mục frames/ trong:\n{folder}")
+            return
+        if folder == self.archive_dir or not self.confirm_discard():
+            return
+        self.close_snippet()
+        self.archive_dir = folder
+        self.load_dataset()
+        self.set_status(f"Đã mở dataset {self.short_path(folder)}: {len(self.snippets)} clip")
 
     def update_stats(self):
         unlabeled = [s for s in self.snippets if s["split"] == "unlabeled"]
@@ -437,7 +486,7 @@ class DesktopFrameLabeler:
                             b["xtl"], b["xbr"] = round(b["xtl"] * sx, 2), round(b["xbr"] * sx, 2)
                             b["ytl"], b["ybr"] = round(b["ytl"] * sy, 2), round(b["ybr"] * sy, 2)
         elif os.path.isdir(txt_d) and any(f.endswith(".txt") for f in os.listdir(txt_d)):
-            parsed = parse_yolo_txt(txt_d, self.img_w, self.img_h)
+            parsed = parse_yolo_txt(txt_d, self.img_w, self.img_h, class_map=self.yolo_class_map)
             if parsed:
                 anns = parsed["annotations"]
         return {int(k): v for k, v in anns.items() if v}
@@ -494,7 +543,7 @@ class DesktopFrameLabeler:
             dash = (5, 3) if b.get("source") == "interpolation" else None
             self.canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=3 if is_sel else 2, dash=dash, tags="box")
 
-            text = f"{i + 1}:{b['label'].upper()}"
+            text = f"{i + 1}:{self.label_names[b['label']].upper()}"
             ty = y1 - 16 if y1 >= 16 else y1
             self.canvas.create_rectangle(x1, ty, x1 + len(text) * 7 + 8, ty + 16, fill=color, outline=color, tags="box")
             self.canvas.create_text(x1 + 4, ty + 8, text=text, fill="#000", font=("Inter", 8, "bold"), anchor="w", tags="box")
@@ -673,7 +722,7 @@ class DesktopFrameLabeler:
         self.box_count_lbl.config(text=str(len(boxes)))
         for i, b in enumerate(boxes):
             src = "~" if b.get("source") == "interpolation" else " "
-            self.boxes_listbox.insert(tk.END, f"{i + 1}.{src}{b['label'].upper()} ({int(b['xtl'])},{int(b['ytl'])})-({int(b['xbr'])},{int(b['ybr'])})")
+            self.boxes_listbox.insert(tk.END, f"{i + 1}.{src}{self.label_names[b['label']].upper()} ({int(b['xtl'])},{int(b['ytl'])})-({int(b['xbr'])},{int(b['ybr'])})")
         if 0 <= self.selected_box_idx < len(boxes):
             self.boxes_listbox.selection_set(self.selected_box_idx)
 
@@ -944,13 +993,17 @@ class DesktopFrameLabeler:
             xml_path = save_cvat_xml(
                 self.current_snippet, self.annotations,
                 width=self.img_w, height=self.img_h, total_frames=self.total_frames,
-                output_path=os.path.join(labels_dir, f"{self.current_snippet}.xml")
+                output_path=os.path.join(labels_dir, f"{self.current_snippet}.xml"),
+                label_names=self.label_names
             )
-            txt_dir = save_yolo_txt(
-                self.current_snippet, self.annotations,
-                width=self.img_w, height=self.img_h, total_frames=self.total_frames,
-                output_dir=os.path.join(labels_dir, self.current_snippet)
-            )
+            txt_dir = None
+            if not self.repo_layout:  # the repo dataset keeps labels/<clip>.xml only
+                txt_dir = save_yolo_txt(
+                    self.current_snippet, self.annotations,
+                    width=self.img_w, height=self.img_h, total_frames=self.total_frames,
+                    output_dir=os.path.join(labels_dir, self.current_snippet),
+                    class_map=self.yolo_class_map
+                )
         except Exception as ex:
             messagebox.showerror("Lỗi lưu nhãn", str(ex))
             return False
@@ -961,7 +1014,8 @@ class DesktopFrameLabeler:
                 s["is_labeled"] = True
         self.update_stats()
         self.render_snippet_list()
-        self.set_status(f"💾 Đã lưu lúc {time.strftime('%H:%M:%S')} → {self.short_path(xml_path)} + {self.short_path(txt_dir)}/")
+        saved = self.short_path(xml_path) + (f" + {self.short_path(txt_dir)}/" if txt_dir else "")
+        self.set_status(f"💾 Đã lưu lúc {time.strftime('%H:%M:%S')} → {saved}")
         return True
 
     @staticmethod
@@ -1028,7 +1082,7 @@ class DesktopFrameLabeler:
 
         tk.Label(dlg, text="🗑️ Xoá bộ frame", font=("Inter", 11, "bold"), fg="#fca5a5", bg="#1e293b").pack(anchor="w", padx=16, pady=(14, 4))
         tk.Label(dlg, text=snippet_id, font=("Inter", 9, "bold"), fg="#f8fafc", bg="#1e293b", wraplength=440, justify="left").pack(anchor="w", padx=16)
-        info = [f"• {meta['frame_count'] if meta else 0} frame trong archive/frames/{snippet_id}/"]
+        info = [f"• {meta['frame_count'] if meta else 0} frame trong {os.path.basename(self.archive_dir)}/frames/{snippet_id}/"]
         if "xml" in paths or "txt" in paths:
             info.append("• Có nhãn: " + " + ".join(k.upper() for k in ("xml", "txt") if k in paths))
         if splits:
@@ -1041,7 +1095,7 @@ class DesktopFrameLabeler:
         permanent_var = tk.BooleanVar(value=False)
         opts = dict(bg="#1e293b", fg="#f8fafc", selectcolor="#0f172a", activebackground="#1e293b", activeforeground="#fff", font=("Inter", 8))
         tk.Checkbutton(dlg, text="Xoá cả nhãn (XML + YOLO TXT)", variable=labels_var, **opts).pack(anchor="w", padx=12)
-        tk.Checkbutton(dlg, text="Xoá vĩnh viễn (không chuyển vào archive/_trash, không khôi phục được)", variable=permanent_var, **opts).pack(anchor="w", padx=12)
+        tk.Checkbutton(dlg, text=f"Xoá vĩnh viễn (không chuyển vào {os.path.basename(self.archive_dir)}/_trash, không khôi phục được)", variable=permanent_var, **opts).pack(anchor="w", padx=12)
 
         result = {"ok": False}
 
@@ -1114,8 +1168,126 @@ class DesktopFrameLabeler:
         subprocess.Popen([sys.executable, EXTRACTOR_SCRIPT], cwd=os.path.dirname(EXTRACTOR_SCRIPT))
         self.set_status("Đã mở tool tách frame. Bấm 🔄 sau khi tách xong để cập nhật danh sách clip.")
 
+    def add_frame_folder(self):
+        """Import a folder of images as a new clip (archive/frames/<name>/000001.jpg ...)."""
+        if self._import_running:
+            messagebox.showinfo("Thêm bộ frame", "Đang thêm một bộ frame khác, hãy đợi xong.")
+            return
+        src = filedialog.askdirectory(parent=self.root, title="Chọn thư mục chứa ảnh frame")
+        if not src:
+            return
+        try:
+            files = list_image_files(src)
+        except OSError as ex:
+            messagebox.showerror("Thêm bộ frame", str(ex))
+            return
+        if not files:
+            messagebox.showerror("Thêm bộ frame", f"Không có ảnh ({', '.join(IMPORT_EXTS)}) trong:\n{src}")
+            return
+        with Image.open(os.path.join(src, files[0])) as img:
+            src_w, src_h = img.size
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Thêm bộ frame")
+        dlg.configure(bg="#1e293b")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+
+        tk.Label(dlg, text="➕ Thêm bộ frame", font=("Inter", 11, "bold"), fg="#86efac", bg="#1e293b").pack(anchor="w", padx=16, pady=(14, 4))
+        tk.Label(dlg, text=f"{src}\n{len(files)} ảnh, {src_w}x{src_h}  ({files[0]} … {files[-1]})", font=("Inter", 8),
+                 fg="#cbd5e1", bg="#1e293b", wraplength=460, justify="left").pack(anchor="w", padx=16, pady=(0, 8))
+
+        form = tk.Frame(dlg, bg="#1e293b")
+        form.pack(fill="x", padx=16)
+        lbl = dict(font=("Inter", 8), fg="#f8fafc", bg="#1e293b")
+        tk.Label(form, text="Tên bộ frame:", **lbl).grid(row=0, column=0, sticky="w", pady=3)
+        name_var = tk.StringVar(value=os.path.basename(os.path.normpath(src)).strip().replace(" ", "_"))
+        name_entry = tk.Entry(form, textvariable=name_var, bg="#0f172a", fg="#fff", insertbackground="#fff", relief="flat", font=("Inter", 9), width=42)
+        name_entry.grid(row=0, column=1, sticky="w", padx=(8, 0), ipady=3)
+        tk.Label(form, text="Thêm vào:", **lbl).grid(row=1, column=0, sticky="w", pady=3)
+        split_var = tk.StringVar(value="unlabeled")
+        ttk.Combobox(form, textvariable=split_var, values=["unlabeled", "train", "valid", "test"], width=12, state="readonly").grid(row=1, column=1, sticky="w", padx=(8, 0))
+
+        resize_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(dlg, text="Resize về 224x224 (giống dataset gốc, YOWO tính box theo 224)", variable=resize_var,
+                       bg="#1e293b", fg="#f8fafc", selectcolor="#0f172a", activebackground="#1e293b",
+                       activeforeground="#fff", font=("Inter", 8)).pack(anchor="w", padx=12, pady=(8, 0))
+        tk.Label(dlg, text="Ảnh được đổi tên thành 000001.jpg, 000002.jpg… theo thứ tự tên file.",
+                 font=("Inter", 8), fg="#94a3b8", bg="#1e293b").pack(anchor="w", padx=16, pady=(4, 0))
+
+        result = {}
+
+        def do_add():
+            name = name_var.get().strip()
+            if not name or any(c in name for c in '\\/:*?"<>|'):
+                messagebox.showerror("Thêm bộ frame", "Tên không hợp lệ (không được chứa \\ / : * ? \" < > |).", parent=dlg)
+                return
+            if any(s["snippet_id"] == name for s in self.snippets) or os.path.exists(os.path.join(self.archive_dir, "frames", name)):
+                messagebox.showerror("Thêm bộ frame", f"Bộ frame '{name}' đã tồn tại, hãy đặt tên khác.", parent=dlg)
+                return
+            result.update(name=name, split=split_var.get(), resize=resize_var.get())
+            dlg.destroy()
+
+        row = tk.Frame(dlg, bg="#1e293b")
+        row.pack(fill="x", padx=16, pady=(12, 14))
+        tk.Button(row, text="Huỷ", font=("Inter", 9), bg="#334155", fg="#fff", relief="flat", width=10, command=dlg.destroy).pack(side="right")
+        tk.Button(row, text="Thêm", font=("Inter", 9, "bold"), bg="#16a34a", fg="#fff", relief="flat", width=10, command=do_add).pack(side="right", padx=6)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.bind("<Return>", lambda e: do_add())
+
+        dlg.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.grab_set()
+        name_entry.focus_set()
+        name_entry.select_range(0, tk.END)
+        self.root.wait_window(dlg)
+        if not result:
+            return
+
+        name, split = result["name"], result["split"]
+        if self.repo_layout:  # no split csv in this layout, clips are found by scanning frames/
+            split = None
+        target = (224, 224) if result["resize"] else None
+        state = {"done": 0, "total": len(files), "error": None, "finished": False}
+        self._import_running = True
+
+        def worker():
+            try:
+                import_frame_folder(src, name, self.archive_dir, target_size=target, split=split,
+                                    progress=lambda d, t: state.update(done=d))
+            except Exception as ex:
+                state["error"] = ex
+            state["finished"] = True
+
+        def poll():
+            if not state["finished"]:
+                self.set_status(f"➕ Đang thêm '{name}': {state['done']} / {state['total']} frame...")
+                self.root.after(150, poll)
+                return
+            self._import_running = False
+            if state["error"]:
+                messagebox.showerror("Lỗi thêm bộ frame", f"Không thêm được '{name}':\n{state['error']}")
+                self.set_status(f"Lỗi thêm bộ frame '{name}'", warn=True)
+                return
+            self.load_dataset()
+            self.set_status(f"➕ Đã thêm '{name}': {state['total']} frame → {os.path.basename(self.archive_dir)}/frames/{name}/" + (f" (+ {split}.csv)" if split else ""))
+            if split not in (None, "unlabeled") and self.current_tab == "unlabeled":
+                self.switch_tab("all")
+            if self.current_snippet is None or self.confirm_discard():
+                self.load_snippet(name)
+                self.render_snippet_list()
+
+        threading.Thread(target=worker, daemon=True).start()
+        poll()
+
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Lifeguard Frame Labeler")
+    parser.add_argument("--dataset", help="Thư mục dataset chứa frames/ và labels/ "
+                        "(mặc định: dataset_lifeguard nếu có, không thì archive)")
+    args = parser.parse_args()
     root = tk.Tk()
-    app = DesktopFrameLabeler(root)
+    app = DesktopFrameLabeler(root, archive_dir=args.dataset)
     root.mainloop()

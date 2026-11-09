@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
@@ -9,6 +10,50 @@ CLASS_MAP = {
     "drown": 1
 }
 REVERSE_CLASS_MAP = {v: k for k, v in CLASS_MAP.items()}
+
+# Names a YOLO classes.txt may use for the labeler's two classes
+CLASS_ALIASES = {
+    "swim": ("swim", "not_drowning", "not_drown", "swimming"),
+    "drown": ("drown", "drowning"),
+}
+
+
+def load_yolo_classes(dataset_dir):
+    """
+    YOLO class order for a dataset: <dataset>/classes.txt (one name per line, line index = class id),
+    e.g. "drowning" then "not_drowning". Returns (class_map {label: id}, names [id -> name]).
+    Without classes.txt the labeler's default order is used (0 = swim, 1 = drown).
+    """
+    path = os.path.join(dataset_dir, "classes.txt")
+    if not os.path.exists(path):
+        return dict(CLASS_MAP), [REVERSE_CLASS_MAP[i] for i in sorted(REVERSE_CLASS_MAP)]
+    with open(path, "r", encoding="utf-8") as f:
+        names = [l.strip() for l in f if l.strip()]
+    class_map = {}
+    for label, aliases in CLASS_ALIASES.items():
+        ids = [i for i, n in enumerate(names) if n.lower() in aliases]
+        if len(ids) != 1:
+            raise ValueError(f"{path}: cần đúng một dòng cho class '{label}' (một trong {', '.join(aliases)})")
+        class_map[label] = ids[0]
+    return class_map, names
+
+
+def canonical_label(name):
+    """'drowning' -> 'drown', 'not_drowning' -> 'swim' (the labeler's internal class keys)."""
+    name = (name or "").lower()
+    for label, aliases in CLASS_ALIASES.items():
+        if name in aliases:
+            return label
+    return "swim"
+
+
+def load_label_names(dataset_dir):
+    """
+    Names written to the XML / shown in the UI, ordered by YOLO class id:
+    {"drown": "drowning", "swim": "not_drowning"} with classes.txt, else {"swim": "swim", "drown": "drown"}.
+    """
+    class_map, names = load_yolo_classes(dataset_dir)
+    return {label: names[i] for label, i in sorted(class_map.items(), key=lambda kv: kv[1])}
 
 def load_dataset_snippets(archive_dir="archive"):
     """
@@ -55,8 +100,37 @@ def load_dataset_snippets(archive_dir="archive"):
                 "has_txt": has_txt,
                 "xml_path": xml_label_path if has_xml else None
             })
-            
+
+    # Clips that are in frames/ but in no csv (the dataset_lifeguard layout of the
+    # drowning-detection repo has no split csv at all): "labeled" if labels/<clip>.xml exists.
+    frames_root = os.path.join(archive_dir, 'frames')
+    listed = {s["snippet_id"] for s in snippets}
+    if os.path.isdir(frames_root):
+        for snippet_id in sorted(os.listdir(frames_root), key=str.lower):
+            frames_dir = os.path.join(frames_root, snippet_id)
+            if snippet_id in listed or snippet_id.endswith(".importing") or not os.path.isdir(frames_dir):
+                continue
+            xml_label_path = os.path.join(archive_dir, 'labels', f"{snippet_id}.xml")
+            has_xml = os.path.exists(xml_label_path)
+            snippets.append({
+                "snippet_id": snippet_id,
+                "split": "labeled" if has_xml else "unlabeled",
+                "frame_count": len([f for f in os.listdir(frames_dir) if f.endswith(('.jpg', '.png', '.jpeg'))]),
+                "is_labeled": has_xml,
+                "has_xml": has_xml,
+                "has_txt": False,
+                "xml_path": xml_label_path if has_xml else None
+            })
+
     return snippets
+
+
+def is_repo_layout(archive_dir="archive"):
+    """
+    True for a dataset laid out like dataset_lifeguard in the drowning-detection repo
+    (frames/ + labels/<clip>.xml + datalist.csv): labels there are CVAT XML only.
+    """
+    return os.path.exists(os.path.join(archive_dir, "datalist.csv"))
 
 def parse_cvat_xml(xml_path):
     """
@@ -93,7 +167,7 @@ def parse_cvat_xml(xml_path):
         
         boxes = []
         for box_elem in image_elem.findall("box"):
-            label = box_elem.get("label", "swim")
+            label = canonical_label(box_elem.get("label", "swim"))
             xtl = float(box_elem.get("xtl", "0"))
             ytl = float(box_elem.get("ytl", "0"))
             xbr = float(box_elem.get("xbr", "0"))
@@ -123,13 +197,14 @@ def parse_cvat_xml(xml_path):
         "annotations": annotations
     }
 
-def parse_yolo_txt(txt_dir, img_width=224, img_height=224):
+def parse_yolo_txt(txt_dir, img_width=224, img_height=224, class_map=None):
     """
     Parses YOLO formatted .txt files in a directory for a snippet.
     Frame index is derived from filename e.g. 000050.txt -> frame index 49 (or 50).
     """
     if not os.path.exists(txt_dir):
         return None
+    reverse_map = {v: k for k, v in (class_map or CLASS_MAP).items()}
         
     annotations = {}
     files = sorted(os.listdir(txt_dir))
@@ -162,7 +237,7 @@ def parse_yolo_txt(txt_dir, img_width=224, img_height=224):
                     xbr = xtl + box_w
                     ybr = ytl + box_h
                     
-                    label_name = REVERSE_CLASS_MAP.get(cls_id, "swim")
+                    label_name = reverse_map.get(cls_id, "swim")
                     boxes.append({
                         "label": label_name,
                         "class_id": cls_id,
@@ -182,11 +257,15 @@ def parse_yolo_txt(txt_dir, img_width=224, img_height=224):
         "annotations": annotations
     }
 
-def save_cvat_xml(snippet_id, annotations, width=224, height=224, total_frames=0, output_path=None):
+def save_cvat_xml(snippet_id, annotations, width=224, height=224, total_frames=0, output_path=None,
+                  label_names=None):
     """
     Saves annotations dictionary to CVAT XML 1.1 format matching existing files.
     annotations: dict mapping frame_idx (int) -> list of box dicts
+    label_names: {"swim": <name>, "drown": <name>} written to the XML, in <labels> order
+    (default "swim", "drown"; see load_label_names).
     """
+    label_names = label_names or {"swim": "swim", "drown": "drown"}
     if output_path is None:
         output_path = os.path.join("archive", "labels", f"{snippet_id}.xml")
         
@@ -229,17 +308,13 @@ def save_cvat_xml(snippet_id, annotations, width=224, height=224, total_frames=0
     
     labels_elem = ET.SubElement(task_elem, "labels")
     
-    label_swim = ET.SubElement(labels_elem, "label")
-    ET.SubElement(label_swim, "name").text = "swim"
-    ET.SubElement(label_swim, "color").text = "#ff00cc"
-    ET.SubElement(label_swim, "type").text = "any"
-    ET.SubElement(label_swim, "attributes")
-    
-    label_drown = ET.SubElement(labels_elem, "label")
-    ET.SubElement(label_drown, "name").text = "drown"
-    ET.SubElement(label_drown, "color").text = "#fafa37"
-    ET.SubElement(label_drown, "type").text = "any"
-    ET.SubElement(label_drown, "attributes")
+    label_colors = {"swim": "#ff00cc", "drown": "#fafa37"}
+    for label, name in label_names.items():
+        label_elem = ET.SubElement(labels_elem, "label")
+        ET.SubElement(label_elem, "name").text = name
+        ET.SubElement(label_elem, "color").text = label_colors[label]
+        ET.SubElement(label_elem, "type").text = "any"
+        ET.SubElement(label_elem, "attributes")
     
     orig_size_elem = ET.SubElement(task_elem, "original_size")
     ET.SubElement(orig_size_elem, "width").text = str(int(width))
@@ -260,7 +335,7 @@ def save_cvat_xml(snippet_id, annotations, width=224, height=224, total_frames=0
         frame_boxes = annotations.get(frame_idx, annotations.get(str(frame_idx), []))
         for box in frame_boxes:
             box_attrs = {
-                "label": str(box.get("label", "swim")),
+                "label": label_names[canonical_label(box.get("label", "swim"))],
                 "source": str(box.get("source", "manual")),
                 "occluded": str(int(box.get("occluded", 0))),
                 "xtl": f"{float(box.get('xtl', 0)):.2f}",
@@ -283,13 +358,21 @@ def save_cvat_xml(snippet_id, annotations, width=224, height=224, total_frames=0
     lines = pretty_xml.splitlines()
     if lines and 'xml version' in lines[0]:
         lines[0] = '<?xml version="1.0" encoding="utf-8"?>'
-        
+
+    # CVAT never writes self-closing tags: <bugtracker></bugtracker>, and <image> / <box> close on their own line
+    for i, line in enumerate(lines):
+        m = re.fullmatch(r"(\s*)<(\w+)([^>]*?)/>", line)
+        if m:
+            indent, tag, attrs = m.groups()
+            sep = "\n" + indent if tag in ("image", "box", "attributes") else ""
+            lines[i] = f"{indent}<{tag}{attrs}>{sep}</{tag}>"
+
     with open(output_path, 'w', encoding='utf-8') as f:
-        f.write("\n".join(lines))
+        f.write("\n".join(lines) + "\n")
         
     return output_path
 
-def save_yolo_txt(snippet_id, annotations, width=224, height=224, total_frames=0, output_dir=None):
+def save_yolo_txt(snippet_id, annotations, width=224, height=224, total_frames=0, output_dir=None, class_map=None):
     """
     Saves annotations to YOLO .txt files format in archive/labels/<snippet_id>/
     Filename format: 000001.txt, 000002.txt ... (1-indexed matching frames)
@@ -307,7 +390,7 @@ def save_yolo_txt(snippet_id, annotations, width=224, height=224, total_frames=0
         lines = []
         for box in frame_boxes:
             label = box.get("label", "swim")
-            cls_id = CLASS_MAP.get(label, 0)
+            cls_id = (class_map or CLASS_MAP).get(label, 0)
             
             xtl = float(box.get("xtl", 0))
             ytl = float(box.get("ytl", 0))
@@ -393,3 +476,71 @@ def delete_snippet(snippet_id, archive_dir="archive", delete_labels=True, perman
             edited_csv.append(name)
 
     return trash_dir, removed, edited_csv
+
+
+IMPORT_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+
+
+def natural_key(name):
+    """Sort 'frame_2.jpg' before 'frame_10.jpg'."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
+def list_image_files(folder):
+    return sorted((f for f in os.listdir(folder) if f.lower().endswith(IMPORT_EXTS)), key=natural_key)
+
+
+def add_to_split(snippet_id, split="unlabeled", archive_dir="archive"):
+    """Append snippet_id to <split>.csv once (no duplicates, no blank lines)."""
+    csv_path = os.path.join(archive_dir, f"{split}.csv")
+    existing = []
+    if os.path.exists(csv_path):
+        with open(csv_path, "r", encoding="utf-8") as f:
+            existing = [l.strip() for l in f if l.strip()]
+    if snippet_id in existing:
+        return False
+    existing.append(snippet_id)
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(existing) + "\n")
+    return True
+
+
+def import_frame_folder(src_dir, snippet_id, archive_dir="archive", target_size=(224, 224),
+                        split="unlabeled", quality=95, progress=None):
+    """
+    Copy a folder of images into archive/frames/<snippet_id>/ as 000001.jpg, 000002.jpg, ...
+    (natural sort order), optionally resized to target_size so it matches the original
+    224x224 dataset, and register the clip in <split>.csv (split=None: no csv).
+    progress(done, total) is called after each frame. Returns the number of frames written.
+    """
+    from PIL import Image
+
+    if not snippet_id or any(c in snippet_id for c in '\\/:*?"<>|') or snippet_id in (".", ".."):
+        raise ValueError(f"Tên bộ frame không hợp lệ: {snippet_id!r}")
+    files = list_image_files(src_dir)
+    if not files:
+        raise ValueError(f"Không có ảnh nào trong: {src_dir}")
+    dest = os.path.join(archive_dir, "frames", snippet_id)
+    if os.path.exists(dest) or os.path.exists(os.path.join(archive_dir, "labels", f"{snippet_id}.xml")):
+        raise FileExistsError(f"Bộ frame '{snippet_id}' đã tồn tại")
+
+    tmp = dest + ".importing"
+    if os.path.exists(tmp):
+        shutil.rmtree(tmp)
+    os.makedirs(tmp)
+    try:
+        for i, name in enumerate(files, 1):
+            with Image.open(os.path.join(src_dir, name)) as img:
+                img = img.convert("RGB")
+                if target_size and img.size != tuple(target_size):
+                    img = img.resize(tuple(target_size), Image.BICUBIC)
+                img.save(os.path.join(tmp, f"{i:06d}.jpg"), quality=int(quality))
+            if progress:
+                progress(i, len(files))
+        os.replace(tmp, dest)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    if split:
+        add_to_split(snippet_id, split, archive_dir)
+    return len(files)

@@ -3,19 +3,24 @@
 Bộ công cụ desktop (Tkinter, chạy trực tiếp trên Windows, không cần trình duyệt) phục vụ bài toán phát hiện đuối nước (**Lifeguard Drowning Detection**):
 
 1. **Video Frame Extractor**: tách video thành chuỗi frame, cắt và phóng to vùng tuỳ ý.
-2. **Frame Labeler**: gán nhãn bounding box `swim` / `drown`, xuất **CVAT XML 1.1** và **YOLO TXT**.
-3. **YOWO**: huấn luyện mô hình spatio-temporal (3D CNN + 2D CNN) trên dữ liệu đã gán nhãn.
+2. **YOLO Pre-label**: dùng model YOLO (`labeler/models/best-yolo.pt`) gán nhãn tự động trước, người chỉ cần sửa lại.
+3. **Frame Labeler**: gán / sửa nhãn bounding box `swim` / `drown` (hoặc `not_drowning` / `drowning`), xuất **CVAT XML 1.1** và **YOLO TXT**.
+4. **Export YOLO**: đóng gói dataset đã gán nhãn thành bộ chuẩn Ultralytics (`images/`, `labels/`, `data.yaml`) để up Kaggle / train.
+5. **YOWO**: huấn luyện mô hình spatio-temporal (3D CNN + 2D CNN) trên dữ liệu đã gán nhãn.
 
 ---
 
 ## 📑 Mục Lục
 1. [Cài đặt](#-cài-đặt)
 2. [Quy trình làm việc](#-quy-trình-làm-việc)
-3. [Tách frame từ video](#-tách-frame-từ-video-video_frame_extractorpy)
-4. [Gán nhãn](#-gán-nhãn-desktop_labelerpy)
-5. [Huấn luyện YOWO](#-huấn-luyện-yowo)
-6. [Định dạng đầu ra](#-định-dạng-đầu-ra)
-7. [Cấu trúc thư mục](#-cấu-trúc-thư-mục)
+3. [Quy trình YOLO: video → nhãn → Kaggle](#-quy-trình-yolo-video--nhãn--kaggle)
+4. [Tách frame từ video](#-tách-frame-từ-video-frame_extractor)
+5. [Gán nhãn tự động bằng model](#-gán-nhãn-tự-động-bằng-model-labelerprelabelpy)
+6. [Gán nhãn](#-gán-nhãn-labeler)
+7. [Xuất dataset YOLO](#-xuất-dataset-yolo-labelerexport_yolopy)
+8. [Huấn luyện YOWO](#-huấn-luyện-yowo)
+9. [Định dạng đầu ra](#-định-dạng-đầu-ra)
+10. [Cấu trúc thư mục](#-cấu-trúc-thư-mục)
 
 ---
 
@@ -25,12 +30,15 @@ Yêu cầu **Python 3.8+**:
 
 ```bash
 pip install opencv-python pillow numpy          # Labeler + Extractor
+pip install ultralytics                         # Gán nhãn tự động (prelabel.py)
 pip install torch torchvision                   # Huấn luyện YOWO (tự dùng GPU CUDA nếu có)
 ```
 
 ---
 
 ## 🔁 Quy Trình Làm Việc
+
+### Quy trình YOWO (dataset `archive/`, clip 224x224)
 
 ```text
 Video (.mp4, .webm, ...)
@@ -44,6 +52,59 @@ archive/labels/<clip>.xml  +  archive/labels/<clip>/000001.txt ...
    ▼
 python yowo/run_yowo.py    → yowo/weights/yowo_best.pth
 ```
+
+---
+
+## 🚀 Quy Trình YOLO: Video → Nhãn → Kaggle
+
+Dùng cho dataset YOLO riêng (ví dụ `val_yolo/`): frame giữ nguyên khung hình, nhãn `drowning` / `not_drowning`.
+
+```text
+Video (.mp4)
+   │  1. Tách frame toàn khung, 10 fps                  (frame_extractor)
+   ▼
+val_yolo/frames/<clip>/000001.jpg ...     + val_yolo/classes.txt
+   │  2. Model gán nhãn trước                           (labeler/prelabel.py)
+   ▼
+val_yolo/labels/<clip>.xml + labels/<clip>/*.txt
+   │  3. Người soát và sửa từng frame, Ctrl+S           (labeler/desktop_labeler.py)
+   ▼
+   │  4. Đóng gói chuẩn YOLO                            (labeler/export_yolo.py)
+   ▼
+val_yolo_export/images/val + labels/val + data.yaml  →  upload Kaggle
+```
+
+**Bước 0: tạo thư mục dataset và `classes.txt`.** Mỗi dòng là một class, số dòng (đếm từ 0) là `class_id` trong file TXT. Thứ tự phải **khớp với dataset bạn sẽ gộp vào** (ví dụ dataset Kaggle):
+```text
+not_drowning
+drowning
+```
+→ `0 = not_drowning`, `1 = drowning`. Labeler và các tool đều đọc file này. Nếu không có file, mặc định là `0 = swim`, `1 = drown`.
+
+**Bước 1: tách frame** (từ thư mục `unlabeled/`):
+```bash
+python frame_extractor/video_frame_extractor.py --video "video.mp4" --clip_name my_clip --size original --fps 10 --start 30 --end 125 --output_dir val_yolo/frames/my_clip
+```
+`--size original` giữ nguyên khung hình gốc (YOLO tự resize khi train). Video dài thì chọn đoạn có sự kiện bằng `--start` / `--end`.
+
+**Bước 2: gán nhãn tự động.**
+```bash
+python labeler/prelabel.py --dataset val_yolo
+```
+Chỉ xử lý các clip **chưa có** `labels/<clip>.xml`, nên nhãn đã sửa không bị ghi đè.
+
+**Bước 3: soát và sửa nhãn.**
+```bash
+python labeler/desktop_labeler.py --dataset val_yolo
+```
+Model hay **bỏ sót drowning** (người chìm, chỉ còn tay / đầu). Hãy phát (`Space`) toàn bộ clip, thêm box drowning còn thiếu, xoá box sai, rồi `Ctrl + S`.
+
+**Bước 4: đóng gói.** Xoá thư mục export cũ trước để không lẫn file thừa:
+```bash
+python labeler/export_yolo.py --dataset val_yolo --out val_yolo_export --split val
+```
+
+**Bước 5: upload Kaggle.** Up thư mục `val_yolo_export/`, không phải `val_yolo/`. Nếu gộp vào dataset có sẵn, chỉ chép `images/<split>/` và `labels/<split>/` vào, giữ `data.yaml` của dataset đó. File TXT chỉ chứa số class, nên **thứ tự trong `classes.txt` phải khớp `names:` trong `data.yaml` của Kaggle**, nếu không nhãn sẽ bị đảo mà không báo lỗi.
 
 ---
 
@@ -114,6 +175,35 @@ python frame_extractor/video_frame_extractor.py --video pool.mp4 --clip_name poo
 
 ---
 
+## 🤖 Gán Nhãn Tự Động Bằng Model (`labeler/prelabel.py`)
+
+Chạy model YOLO lên mọi frame và ghi kết quả thành file nhãn của labeler, để người chỉ cần sửa thay vì vẽ từ đầu.
+
+```bash
+python labeler/prelabel.py --dataset val_yolo                         # dùng labeler/models/best-yolo.pt
+python labeler/prelabel.py --dataset val_yolo --clips my_clip --conf 0.2
+```
+Hoặc nhấp đúp **`labeler/run_prelabel.bat`** và nhập tên thư mục dataset.
+
+- Đọc `<dataset>/frames/<clip>/`, ghi `<dataset>/labels/<clip>.xml` (CVAT XML) và `labels/<clip>/*.txt` (YOLO TXT, không ghi với dataset dạng repo có `datalist.csv`).
+- Class của model được ghép **theo tên**, không theo số: `drowning`/`drown` → drown, `not_drowning`/`swim` → swim. Số class ghi ra theo `classes.txt` của dataset, nên model và dataset có thứ tự khác nhau vẫn đúng.
+- Một người bị nhận cả 2 class (IoU ≥ `--overlap`, mặc định 0.4) thì giữ box drowning.
+- Clip đã có XML bị **bỏ qua**. Muốn làm lại thì thêm `--overwrite` (XML cũ được giữ thành `<clip>.xml.bak`).
+
+| Tham số | Ý nghĩa |
+| :--- | :--- |
+| `--dataset DIR` | Thư mục dataset (chứa `frames/`) |
+| `--model PT` | File weights YOLO, mặc định `labeler/models/best-yolo.pt` (0 = drowning, 1 = not_drowning) |
+| `--clips A B` | Chỉ chạy các clip này |
+| `--conf` / `--iou` / `--imgsz` | Ngưỡng tin cậy (0.25) / NMS IoU (0.5) / kích thước suy luận (640) |
+| `--overlap` | Ngưỡng bỏ box swim trùng box drown (0 = tắt) |
+| `--device` | `cpu`, `0`, ... (mặc định tự chọn) |
+| `--overwrite` | Gán lại cả clip đã có nhãn |
+
+> ⚠️ Nhãn do model gán chỉ là bản nháp. Luôn soát lại trong labeler trước khi dùng để train / đánh giá.
+
+---
+
 ## 📝 Gán Nhãn (`labeler/`)
 
 ### Khởi động
@@ -133,6 +223,20 @@ Nhấp đúp **`labeler/run_labeler.bat`**, hoặc chạy `python labeler/deskto
 6. **Lưu**: `Ctrl + S`. Nếu đổi clip hoặc đóng app khi chưa lưu, labeler sẽ hỏi.
 
 > Labeler tự đọc kích thước thật của frame (224, 640, ...), nên toạ độ nhãn luôn đúng với ảnh.
+
+### Gán nhãn cho `dataset_lifeguard` (dataset của repo drowning-detection)
+Đặt thư mục `dataset_lifeguard/` (gồm `frames/`, `labels/`, `datalist.csv`) cạnh thư mục `labeler/`. Khi thư mục này tồn tại, labeler mở nó mặc định thay cho `archive/`.
+
+- Dataset này không có file `.csv` chia tập, nên labeler quét trực tiếp `frames/`: clip chưa có `labels/<clip>.xml` nằm ở tab **Unlabeled**, tab **All Clips** gồm cả clip đã có nhãn.
+- `Ctrl + S` chỉ ghi `dataset_lifeguard/labels/<clip>.xml` (CVAT XML 1.1, class `swim` / `drown`, `id` bắt đầu từ 0), cùng định dạng với các file nhãn có sẵn trong repo. Không tạo YOLO TXT.
+- Đổi dataset: bấm **📁** cạnh nút 🔄 và chọn thư mục chứa `frames/`, hoặc chạy `python labeler/desktop_labeler.py --dataset archive`.
+
+### Thêm một bộ frame có sẵn (từ thư mục ảnh)
+Bấm **➕ Thêm bộ frame từ thư mục...** ở cột trái, chọn thư mục chứa ảnh (`.jpg/.jpeg/.png/.bmp/.webp`), đặt tên clip và chọn tập (`unlabeled` / `train` / `valid` / `test`).
+
+- Ảnh được chép vào `archive/frames/<tên>/` và đổi tên thành `000001.jpg`, `000002.jpg`, ... theo thứ tự tự nhiên của tên file (`frame_2` đứng trước `frame_10`).
+- Mặc định resize về **224x224** cho giống dataset gốc (YOWO chia toạ độ box cho 224). Bỏ tick nếu muốn giữ kích thước gốc.
+- Tên clip được thêm vào file `.csv` của tập đã chọn; clip vừa thêm được mở ngay để gán nhãn.
 
 ### Xoá một bộ frame (clip)
 Chọn clip trong danh sách rồi bấm **🗑️ Xoá bộ frame đang chọn...** ở cuối cột trái, hoặc **chuột phải** vào clip và chọn **Xoá bộ frame...**. Hộp thoại xác nhận cho biết số frame, clip đã có nhãn chưa, và các file `.csv` sẽ bị gỡ tên clip.
@@ -167,6 +271,23 @@ Chuột phải vào clip còn có mục **📂 Mở thư mục frame**.
 | `Ctrl + S` | Lưu XML + YOLO TXT |
 
 Phím tắt không hoạt động khi con trỏ đang nằm trong ô nhập chữ (ô tìm kiếm, tên clip...). Click vào ảnh để dùng lại phím tắt.
+
+---
+
+## 📦 Xuất Dataset YOLO (`labeler/export_yolo.py`)
+
+```bash
+python labeler/export_yolo.py --dataset val_yolo --out val_yolo_export --split val
+```
+Tạo bộ dataset chuẩn Ultralytics:
+```text
+val_yolo_export/
+├── images/val/<clip>_000001.jpg
+├── labels/val/<clip>_000001.txt
+└── data.yaml        # names theo classes.txt, không ghi đường dẫn tuyệt đối nên chạy được trên Kaggle
+```
+- Chỉ xuất clip có `labels/<clip>.xml`. Frame không có box vẫn có file TXT rỗng (ảnh nền).
+- `--clips A B` để chỉ xuất một số clip, `--split train|val|test` để chọn thư mục tập.
 
 ---
 
@@ -218,7 +339,7 @@ Mỗi frame một file, đánh số giống tên ảnh (`000051.jpg` ↔ `000051
 <class_id> <x_center> <y_center> <width> <height>
 0 0.493304 0.758929 0.352679 0.267857
 ```
-`class_id`: `0` = swim, `1` = drown. Frame không có box vẫn có file rỗng.
+`class_id`: mặc định `0` = swim, `1` = drown. Dataset có `classes.txt` thì theo thứ tự dòng trong file đó. Frame không có box vẫn có file rỗng.
 
 ---
 
@@ -242,9 +363,13 @@ unlabeled/
 │
 ├── labeler/                       # 📝 Tool gán nhãn (độc lập)
 │   ├── desktop_labeler.py         #    Ứng dụng gán nhãn
-│   ├── annotation_io.py           #    Đọc / ghi CVAT XML 1.1 và YOLO TXT
+│   ├── annotation_io.py           #    Đọc / ghi CVAT XML 1.1 và YOLO TXT, đọc classes.txt
+│   ├── prelabel.py                #    Gán nhãn tự động bằng model YOLO
+│   ├── export_yolo.py             #    Xuất dataset chuẩn Ultralytics (images/labels/data.yaml)
+│   ├── models/best-yolo.pt        #    Model YOLO dùng cho prelabel (0 = drowning, 1 = not_drowning)
 │   ├── zoom_canvas.py             #    Zoom / pan khung xem
-│   └── run_labeler.bat            #    Nhấp đúp để chạy
+│   ├── run_labeler.bat            #    Nhấp đúp để chạy labeler
+│   └── run_prelabel.bat           #    Nhấp đúp để gán nhãn tự động
 │
 ├── yowo/                          # 🧠 Huấn luyện YOWO (tách riêng)
 │   ├── run_yowo.py                #    CLI huấn luyện
@@ -253,9 +378,11 @@ unlabeled/
 │   ├── utils/annotation_io.py     #    Bản sao đọc nhãn XML
 │   └── weights/yowo_best.pth      #    Trọng số sau huấn luyện
 │
+├── val_yolo/                      # Dataset YOLO (frames/, labels/, classes.txt), chỉ ở local
+├── val_yolo_export/               # Bản đóng gói để up Kaggle, chỉ ở local
 └── video/                         # Video gốc để tách frame
 ```
 
-> Repo GitHub chỉ chứa `frame_extractor/`, `labeler/` và README. Thư mục `archive/` (dataset), `video/` và `yowo/` chỉ có ở máy local. Sau khi clone, hãy tạo thư mục `archive/` cạnh 2 thư mục tool: tool tách frame sẽ tự tạo `archive/frames/` và `archive/unlabeled.csv`.
+> Repo GitHub chỉ chứa `frame_extractor/`, `labeler/` (gồm cả model `labeler/models/best-yolo.pt`, ~20 MB) và README. Thư mục `archive/` (dataset), `video/` và `yowo/` chỉ có ở máy local. Sau khi clone, hãy tạo thư mục `archive/` cạnh 2 thư mục tool: tool tách frame sẽ tự tạo `archive/frames/` và `archive/unlabeled.csv`.
 
 Mỗi thư mục tool chạy độc lập, không import code của nhau, và luôn đọc/ghi `archive/` ở thư mục gốc (cùng cấp với thư mục tool), dù chạy lệnh từ đâu. Khi copy tool sang máy khác, giữ nguyên cấu trúc `<thư_mục_gốc>/archive` + `<thư_mục_gốc>/<tool>/`.
