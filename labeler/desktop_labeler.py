@@ -114,7 +114,7 @@ class DesktopFrameLabeler:
         self.cache = FrameCache(CACHE_SIZE)
         self.current_pil = None
         self._cursor = "crosshair"
-        self.show_box_labels = tk.BooleanVar(master=self.root, value=False)
+        self.show_swim_labels = tk.BooleanVar(master=self.root, value=False)
 
         # Editing state
         self.drag = None
@@ -244,12 +244,12 @@ class DesktopFrameLabeler:
         self.drown_btn = tk.Button(class_btn_frame, text="Drown (2)", font=("Inter", 9), bg="#334155", fg="#fff", relief="flat", command=lambda: self.set_class("drown"))
         self.drown_btn.pack(side="right", expand=True, fill="x", padx=(4, 0), ipady=4)
         tk.Label(right_panel, text="Chọn box rồi bấm 1/2 để đổi class", font=("Inter", 7), fg="#64748b", bg="#1e293b").pack(anchor="w", padx=14, pady=(0, 6))
-        self.show_box_labels_checkbox = tk.Checkbutton(
-            right_panel, text="Hiện nhãn trên box", variable=self.show_box_labels,
+        self.show_swim_labels_checkbox = tk.Checkbutton(
+            right_panel, text="Hiện nhãn Swim", variable=self.show_swim_labels,
             command=self.draw_boxes, font=("Inter", 8), bg="#1e293b", fg="#f8fafc",
             activebackground="#1e293b", activeforeground="#f8fafc", selectcolor="#334155",
         )
-        self.show_box_labels_checkbox.pack(anchor="w", padx=14, pady=(0, 6))
+        self.show_swim_labels_checkbox.pack(anchor="w", padx=14, pady=(0, 6))
 
         boxes_hdr = tk.Frame(right_panel, bg="#1e293b")
         boxes_hdr.pack(fill="x", padx=14, pady=(6, 4))
@@ -550,7 +550,7 @@ class DesktopFrameLabeler:
             dash = (5, 3) if b.get("source") == "interpolation" else None
             self.canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=3 if is_sel else 2, dash=dash, tags="box")
 
-            if self.show_box_labels.get():
+            if b["label"] == "drown" or self.show_swim_labels.get():
                 text = f"{i + 1}:{self.label_names[b['label']].upper()}"
                 ty = y1 - 16 if y1 >= 16 else y1
                 self.canvas.create_rectangle(x1, ty, x1 + len(text) * 7 + 8, ty + 16, fill=color, outline=color, tags="box")

@@ -224,8 +224,10 @@ Nhấp đúp **`labeler/run_labeler.bat`**, hoặc chạy `python labeler/deskto
 
 > Labeler tự đọc kích thước thật của frame (224, 640, ...), nên toạ độ nhãn luôn đúng với ảnh.
 
-Ô **Hiện nhãn trên box** nằm dưới các nút chọn class ở cột phải. Mặc định
-tắt để chỉ hiện box màu; bật để hiện lại số thứ tự và tên class trên ảnh.
+Ô **Hiện nhãn Swim** nằm dưới các nút chọn class ở cột phải. Mặc định tắt
+để ẩn số thứ tự và tên `swim/not_drowning` trên ảnh, chỉ giữ box màu.
+Nhãn `drown/drowning` luôn hiển thị. Bật ô này để hiện cả nhãn Swim.
+Labeler không lưu điểm tin cậy nên không có phần trăm để hiển thị.
 Ẩn chữ vẫn cho phép chọn, kéo và resize box, không thay đổi dữ liệu nhãn.
 
 ### Gán nhãn cho `dataset_lifeguard` (dataset của repo drowning-detection)
