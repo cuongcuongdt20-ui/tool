@@ -224,6 +224,10 @@ Nhấp đúp **`labeler/run_labeler.bat`**, hoặc chạy `python labeler/deskto
 
 > Labeler tự đọc kích thước thật của frame (224, 640, ...), nên toạ độ nhãn luôn đúng với ảnh.
 
+Ô **Hiện nhãn trên box** nằm dưới các nút chọn class ở cột phải. Mặc định
+tắt để chỉ hiện box màu; bật để hiện lại số thứ tự và tên class trên ảnh.
+Ẩn chữ vẫn cho phép chọn, kéo và resize box, không thay đổi dữ liệu nhãn.
+
 ### Gán nhãn cho `dataset_lifeguard` (dataset của repo drowning-detection)
 Đặt thư mục `dataset_lifeguard/` (gồm `frames/`, `labels/`, `datalist.csv`) cạnh thư mục `labeler/`. Khi thư mục này tồn tại, labeler mở nó mặc định thay cho `archive/`.
 
