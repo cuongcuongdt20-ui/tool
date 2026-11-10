@@ -1,11 +1,10 @@
-"""Crop labeled frames/video, with transactional replacement and backups."""
+"""Crop labeled frames only, with transactional replacement and backups."""
 import json
 import math
 import os
 from pathlib import Path
 import re
 import shutil
-import subprocess
 import tempfile
 import uuid
 from datetime import datetime, timezone
@@ -20,7 +19,7 @@ class CropCancelled(Exception):
 
 
 def normalize_crop_roi(roi, width, height):
-    """Clamp x/y/w/h and use even dimensions compatible with MP4 encoders."""
+    """Clamp x/y/w/h, retaining the crop tool's even-pixel dimensions."""
     if len(roi) != 4 or not all(math.isfinite(float(v)) for v in roi):
         raise ValueError("Vùng cắt phải có bốn số hữu hạn: x, y, rộng, cao")
     x, y, w, h = map(float, roi)
@@ -64,38 +63,9 @@ def _check_cancel(cancelled):
         raise CropCancelled("Đã huỷ cắt clip")
 
 
-def _crop_video(ffmpeg, source, output, roi, frame_size, cancelled):
-    x, y, w, h = roi
-    fw, fh = frame_size
-    # Match the labeled frame geometry, including old frame sets resized from HD video.
-    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(source),
-           "-map", "0:v:0", "-map", "0:a?", "-vf", f"scale={fw}:{fh},crop={w}:{h}:{x}:{y}:exact=1",
-           "-c:v", "libx264", "-crf", "18", "-preset", "fast", "-c:a", "aac",
-           "-movflags", "+faststart", str(output)]
-    process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                               text=True, encoding="utf-8", errors="replace",
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    try:
-        while True:
-            _check_cancel(cancelled)
-            try:
-                _, error = process.communicate(timeout=.2)
-                break
-            except subprocess.TimeoutExpired:
-                continue
-        if process.returncode:
-            raise RuntimeError(f"Không xuất được video: {error[-2000:]}")
-        if not output.is_file() or output.stat().st_size == 0:
-            raise RuntimeError("Video xuất bị rỗng")
-    finally:
-        if process.poll() is None:
-            process.kill()
-            process.communicate()
-
-
 def crop_labeled_clip(dataset_dir, source_clip, new_clip, annotations, roi, *,
-                      video_path=None, progress=None, cancelled=None, replace=False):
-    """Crop a new clip, or replace the current one transactionally with a backup."""
+                      progress=None, cancelled=None, replace=False):
+    """Crop frames/labels into a new clip or replace them with a backup; never edit video."""
     root = Path(dataset_dir).resolve()
     for name in (source_clip, new_clip):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name or ""):
@@ -120,22 +90,12 @@ def crop_labeled_clip(dataset_dir, source_clip, new_clip, annotations, roi, *,
     if not is_repo_layout(str(root)):
         targets["txt"] = root / "labels" / new_clip
     # Check all known destinations, including outputs not enabled in this operation.
-    reserved = list(targets.values()) + [root / "labels" / new_clip, root / "videos" / f"{new_clip}.mp4"]
+    reserved = list(targets.values()) + [root / "labels" / new_clip]
     for path in reserved:
         if not path.resolve().is_relative_to(root):
             raise ValueError(f"Đường dẫn đích nằm ngoài dataset: {path}")
         if os.path.lexists(path) and not replace:
             raise FileExistsError(f"Đích đã tồn tại, hãy đặt tên clip khác: {path}")
-    video = Path(video_path).expanduser().resolve() if video_path else None
-    ffmpeg = shutil.which("ffmpeg") if video else None
-    if video:
-        if not video.is_file():
-            raise FileNotFoundError(f"Không tìm thấy video: {video}")
-        if not ffmpeg:
-            raise RuntimeError("Cần FFmpeg trong PATH để xuất MP4; hoặc bỏ chọn xuất video")
-        if replace and video.suffix.lower() != ".mp4":
-            raise ValueError("Chọn file MP4 để crop và thay thế trực tiếp")
-        targets["video"] = video if replace else root / "videos" / f"{new_clip}.mp4"
     _check_cancel(cancelled)
     stage = Path(tempfile.mkdtemp(prefix=".crop-", dir=root))
     committed = []
@@ -156,31 +116,26 @@ def crop_labeled_clip(dataset_dir, source_clip, new_clip, annotations, roi, *,
         save_cvat_xml(new_clip, cropped, w, h, len(files), str(stage / "xml"), label_names=label_names)
         if "txt" in targets:
             save_yolo_txt(new_clip, cropped, w, h, len(files), str(stage / "txt"), class_map=class_map)
-        if video:
-            if progress:
-                progress(len(files), len(files), "video")
-            _crop_video(ffmpeg, video, stage / "video.mp4", roi, frame_size, cancelled)
         log = dict(clip_name=new_clip, source_clip=source_clip, roi_xywh=roi,
                    original_size=frame_size, output_size=[w, h], frames=len(files),
                    frame_mapping=[[name, p.name] for name, p in zip(output_names, files)],
-                   source_video=str(video) if video else None, video_keeps_source_fps=bool(video),
-                   video_audio="AAC from source when available" if video else None, **stats)
+                   crop_scope="frames_and_labels", **stats)
         (stage / "log").write_text(json.dumps(log, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         _check_cancel(cancelled)
         if replace:
             backup = _replace_outputs(root, targets, stage, source_clip, annotations,
                                       frame_size, label_names, len(files), cancelled)
             return dict(clip=new_clip, frames=len(files), roi=roi, size=(w, h),
-                        video=str(video) if video else None, backup=str(backup), **stats)
+                        backup=str(backup), **stats)
         # Publish frames last: the labeler never sees a clip with unfinished labels.
-        for key in ("xml", "txt", "log", "video", "frames"):
+        for key in ("xml", "txt", "log", "frames"):
             if key not in targets:
                 continue
             target = targets[key]
             target.parent.mkdir(parents=True, exist_ok=True)
             if not target.resolve().is_relative_to(root) or os.path.lexists(target):
                 raise FileExistsError(f"Không ghi đè đích: {target}")
-            staged = stage / ("video.mp4" if key == "video" else key)
+            staged = stage / key
             if staged.is_dir():
                 os.rename(staged, target)
                 committed.append((key, target))
@@ -189,8 +144,7 @@ def crop_labeled_clip(dataset_dir, source_clip, new_clip, annotations, roi, *,
                     committed.append((key, target))
                     with staged.open("rb") as inp:
                         shutil.copyfileobj(inp, out)
-        return dict(clip=new_clip, frames=len(files), roi=roi, size=(w, h),
-                    video=str(targets["video"]) if video else None, **stats)
+        return dict(clip=new_clip, frames=len(files), roi=roi, size=(w, h), **stats)
     except BaseException:
         for index, (_, target) in enumerate(reversed(committed)):
             if not target.resolve().is_relative_to(root):
@@ -203,20 +157,6 @@ def crop_labeled_clip(dataset_dir, source_clip, new_clip, annotations, roi, *,
         shutil.rmtree(stage)
 
 
-def _local_video_copy(source, target):
-    """Stage beside the selected MP4 so os.replace is atomic across dataset drives."""
-    descriptor, name = tempfile.mkstemp(prefix=".crop-", suffix=".mp4", dir=target.parent)
-    os.close(descriptor)
-    temporary = Path(name)
-    try:
-        shutil.copy2(source, temporary)
-        os.replace(temporary, target)
-    finally:
-        if temporary.parent.resolve() != target.parent.resolve():
-            raise RuntimeError("Đường dẫn video tạm không hợp lệ")
-        temporary.unlink(missing_ok=True)
-
-
 def _replace_outputs(root, targets, stage, clip, annotations, frame_size, label_names, total, cancelled):
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     backup = root / "_crop_backups" / clip / stamp
@@ -226,8 +166,6 @@ def _replace_outputs(root, targets, stage, clip, annotations, frame_size, label_
     save_cvat_xml(clip, annotations, *frame_size, total,
                   str(backup / "annotations_before_crop.xml"), label_names=label_names)
     originals, published = [], []
-    video = targets.get("video")
-    video_replaced = False
     manifest = dict(clip=clip, created_utc=stamp, status="preparing", original_paths={
         key: str(path) for key, path in targets.items()})
     manifest_path = backup / "backup.json"
@@ -237,10 +175,6 @@ def _replace_outputs(root, targets, stage, clip, annotations, frame_size, label_
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     try:
-        if video:
-            shutil.copy2(video, backup / "video.mp4")
-            if (backup / "video.mp4").stat().st_size != video.stat().st_size:
-                raise OSError("Không sao lưu được toàn bộ video")
         write_status("backed_up")
         _check_cancel(cancelled)
         for key in ("xml", "txt", "log", "frames"):
@@ -255,22 +189,15 @@ def _replace_outputs(root, targets, stage, clip, annotations, frame_size, label_
                 originals.append((key, target))
         log = json.loads((stage / "log").read_text(encoding="utf-8"))
         log.update(operation="replace_crop", backup=str(backup))
-        if video:
-            log["current_video"] = str(video)
         (stage / "log").write_text(json.dumps(log, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         for key in ("xml", "txt", "log", "frames"):
             if key not in targets:
                 continue
             os.rename(stage / key, targets[key])
             published.append((key, targets[key]))
-        if video:
-            _local_video_copy(stage / "video.mp4", video)
-            video_replaced = True
         write_status("complete")
         return backup
     except BaseException:
-        if video_replaced:
-            _local_video_copy(backup / "video.mp4", video)
         for key, target in reversed(published):
             if not target.resolve().is_relative_to(root):
                 raise RuntimeError("Đường dẫn rollback không hợp lệ")

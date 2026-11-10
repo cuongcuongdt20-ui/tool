@@ -5,8 +5,6 @@ import argparse
 import time
 import subprocess
 import threading
-import json
-import tempfile
 from pathlib import Path
 from collections import OrderedDict
 import tkinter as tk
@@ -240,20 +238,12 @@ class DesktopFrameLabeler:
         tk.Label(self.crop_bar, textvariable=self.crop_info, bg="#1e293b", fg="#67e8f9",
                  font=("Inter", 8)).grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=3)
         tk.Button(self.crop_bar, text="Toàn khung", command=self.reset_crop_region).grid(row=0, column=2, padx=3)
-        self.crop_video_enabled = tk.BooleanVar(master=self.root, value=True)
-        tk.Checkbutton(self.crop_bar, text="Cắt cả MP4", variable=self.crop_video_enabled,
-                       bg="#1e293b", fg="#f8fafc", activebackground="#1e293b",
-                       activeforeground="#f8fafc", selectcolor="#334155").grid(row=1, column=0, padx=3)
-        self.crop_video_path = tk.StringVar(master=self.root)
-        tk.Entry(self.crop_bar, textvariable=self.crop_video_path, width=1, bg="#0f172a",
-                 fg="#f8fafc", insertbackground="#fff").grid(row=1, column=1, sticky="ew", padx=3)
-        tk.Button(self.crop_bar, text="Chọn MP4…", command=self.browse_crop_video).grid(row=1, column=2, padx=3)
-        tk.Button(self.crop_bar, text="Crop và thay thế clip", command=self.apply_clip_crop,
-                  bg="#0e7490", fg="#fff").grid(row=2, column=2, padx=3, pady=3)
+        tk.Button(self.crop_bar, text="Crop frame và nhãn", command=self.apply_clip_crop,
+                  bg="#0e7490", fg="#fff").grid(row=1, column=2, padx=3, pady=3)
         tk.Label(self.crop_bar, text="Play/tua để xem vùng giữ lại. Ctrl+kéo để vẽ lại; Esc để thoát.\n"
-                 "Thay thế clip hiện tại; bản cũ lưu trong _crop_backups.\n"
+                 "Chỉ thay thế frame và nhãn; giữ nguyên video nguồn. Bản cũ lưu trong _crop_backups.\n"
                  "Box bị cắt ở mép sẽ xoá toàn bộ nhãn.", justify="left",
-                 bg="#1e293b", fg="#94a3b8", font=("Inter", 7)).grid(row=2, column=0, columnspan=2,
+                 bg="#1e293b", fg="#94a3b8", font=("Inter", 7)).grid(row=1, column=0, columnspan=2,
                                                                      sticky="w", padx=6, pady=3)
         self.crop_bar.grid_remove()
         self.sequence_bar = tk.Frame(center_frame, bg="#1e293b")
@@ -327,7 +317,7 @@ class DesktopFrameLabeler:
             b.pack(fill="x", pady=2, ipady=3)
             return b
 
-        self.crop_button = action_btn("✂ Crop ngay trên video", self.open_clip_crop, bg="#0e7490", bold=True)
+        self.crop_button = action_btn("✂ Crop bộ frame", self.open_clip_crop, bg="#0e7490", bold=True)
         action_btn("📋 Copy sang frame kế (C)", self.copy_boxes_to_next)
         action_btn("⚡ Nội suy tới keyframe kế (I)", self.interpolate_range)
         action_btn("⚡ Nội suy toàn clip (Shift+I)", self.interpolate_all)
@@ -1298,87 +1288,15 @@ class DesktopFrameLabeler:
         self.selected_box_idx = -1
         if enabled:
             self.crop_roi = normalize_crop_roi((0, 0, self.img_w, self.img_h), self.img_w, self.img_h)
-            self.crop_video_path.set(self._known_crop_video())
             self.crop_bar.grid()
             self.crop_button.config(text="✂ Thoát chế độ crop")
             self.set_status("Kéo trên video để chọn vùng giữ lại; Play/tua để kiểm tra trước khi áp dụng.")
         else:
             self.crop_roi = None
             self.crop_bar.grid_remove()
-            self.crop_button.config(text="✂ Crop ngay trên video")
+            self.crop_button.config(text="✂ Crop bộ frame")
             self.canvas.config(cursor="crosshair")
         self.draw_boxes()
-
-    def _known_crop_video(self):
-        root = Path(self.archive_dir)
-        records = []
-        for metadata in (root / "extract_logs" / f"{self.current_snippet}.json",
-                         root / "audit" / f"{self.current_snippet}_extraction.json"):
-            try:
-                data = json.loads(metadata.read_text(encoding="utf-8"))
-                if not isinstance(data, dict):
-                    continue
-                records.append(data)
-            except (OSError, ValueError, TypeError):
-                continue
-
-        def existing(path):
-            if not isinstance(path, str) or not path:
-                return ""
-            candidate = Path(path).expanduser()
-            if not candidate.is_absolute():
-                candidate = Path(PROJECT_DIR).parent / candidate
-            return str(candidate.resolve()) if candidate.is_file() and candidate.suffix.lower() == ".mp4" else ""
-
-        for data in records:
-            if data.get("current_video"):
-                return existing(data["current_video"])
-        local = root / "videos" / f"{self.current_snippet}.mp4"
-        if local.is_file():
-            return str(local.resolve())
-        for data in records:
-            if linked := existing(data.get("source_video") or data.get("video")):
-                return linked
-        return ""
-
-    def _remember_crop_video(self, path):
-        if not self.current_snippet:
-            raise ValueError("Chưa chọn clip")
-        video = Path(path).expanduser().resolve()
-        if not video.is_file() or video.suffix.lower() != ".mp4":
-            raise ValueError("Đường dẫn phải trỏ tới file MP4 đang tồn tại")
-        root = Path(self.archive_dir).resolve()
-        metadata = root / "extract_logs" / f"{self.current_snippet}.json"
-        if not metadata.resolve().is_relative_to(root):
-            raise ValueError("Đường dẫn log nằm ngoài dataset")
-        data = json.loads(metadata.read_text(encoding="utf-8")) if metadata.is_file() else {}
-        if not isinstance(data, dict):
-            raise ValueError("Log hiện tại không hợp lệ, chưa lưu được liên kết video")
-        data.update(clip_name=self.current_snippet, current_video=str(video))
-        if not data.get("source_video") and not data.get("video"):
-            data["source_video"] = str(video)
-        metadata.parent.mkdir(parents=True, exist_ok=True)
-        temporary = None
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=metadata.parent,
-                                             prefix=".video-source-", suffix=".json", delete=False) as stream:
-                temporary = Path(stream.name)
-                json.dump(data, stream, ensure_ascii=False, indent=2)
-                stream.write("\n")
-            os.replace(temporary, metadata)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
-
-    def browse_crop_video(self):
-        path = filedialog.askopenfilename(parent=self.root, title="Chọn MP4 của clip hiện tại để crop và thay thế",
-                                         filetypes=[("MP4", "*.mp4")])
-        if path:
-            self.crop_video_path.set(path)
-            try:
-                self._remember_crop_video(path)
-            except (OSError, ValueError) as error:
-                self.set_status(f"Đã chọn MP4, nhưng chưa lưu được liên kết: {error}", warn=True)
 
     def reset_crop_region(self):
         self.crop_roi = normalize_crop_roi((0, 0, self.img_w, self.img_h), self.img_w, self.img_h)
@@ -1442,15 +1360,6 @@ class DesktopFrameLabeler:
         if self._crop_dialog is not None and self._crop_dialog.busy:
             return
         self.stop_play()
-        video = self.crop_video_path.get().strip() if self.crop_video_enabled.get() else None
-        if self.crop_video_enabled.get() and not video:
-            video = self._known_crop_video()
-            self.crop_video_path.set(video)
-        if self.crop_video_enabled.get() and not video:
-            self.browse_crop_video()
-            video = self.crop_video_path.get().strip()
-            if not video:
-                return
         clip, frame = self.current_snippet, self.current_frame_idx
         dataset, roi, annotations = self.archive_dir, self.crop_roi, copy.deepcopy(self.annotations)
 
@@ -1464,12 +1373,12 @@ class DesktopFrameLabeler:
             self.load_snippet(clip)
             self.load_frame(min(frame, self.total_frames - 1))
             self.render_snippet_list()
-            self.set_status(f"✂ Đã thay thế {clip}: giữ {result['kept']}, bỏ {result['removed']} box. Backup: {result['backup']}")
+            self.set_status(f"✂ Đã crop frame {clip}: giữ {result['kept']}, bỏ {result['removed']} box. Video nguồn giữ nguyên. Backup: {result['backup']}")
 
         self._crop_dialog = CropProgressDialog(
             self.root,
             lambda progress, cancelled: crop_labeled_clip(dataset, clip, clip, annotations, roi,
-                                                         video_path=video, progress=progress,
+                                                         progress=progress,
                                                          cancelled=cancelled, replace=True), complete)
 
     # ================================================================== delete clip

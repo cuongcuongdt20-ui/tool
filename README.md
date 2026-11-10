@@ -244,18 +244,14 @@ Bấm **➕ Thêm bộ frame từ thư mục...** ở cột trái, chọn thư m
 - Mặc định resize về **224x224** cho giống dataset gốc (YOWO chia toạ độ box cho 224). Bỏ tick nếu muốn giữ kích thước gốc.
 - Tên clip được thêm vào file `.csv` của tập đã chọn; clip vừa thêm được mở ngay để gán nhãn.
 
-### Crop trực tiếp khi phát, thay thế clip hiện tại
+### Crop trực tiếp khi phát, chỉ cập nhật frame và nhãn
 
-1. Chọn clip rồi bấm **✂ Crop ngay trên video**. Kéo trên chính khung hình đang phát
+1. Chọn clip rồi bấm **✂ Crop bộ frame**. Kéo trên chính khung hình đang phát
    để chọn vùng **giữ lại**; phần ngoài vùng được làm tối.
 2. Có thể Play/tạm dừng, tua hoặc đổi frame để kiểm tra cùng một vùng crop trên cả clip.
    Kéo trong vùng để di chuyển, kéo tay nắm để đổi cỡ, **Ctrl + kéo** để vẽ lại.
    **Esc** hoặc **Thoát chế độ crop** bỏ lựa chọn mà chưa thay đổi dữ liệu.
-3. Giữ **Cắt cả MP4** nếu muốn thay thế cả file video. Tool điền đường dẫn đã biết từ
-   metadata; nếu chưa có, bấm **Chọn MP4…**. Phải chọn đúng đoạn video, cùng khung hình
-   với bộ frame. Bỏ chọn để chỉ cập nhật frame và nhãn.
-   Đường dẫn bạn chọn được nhớ trong log của clip để lần sau không phải chọn lại.
-4. Bấm **Crop và thay thế clip**. Toàn bộ frame, XML/TXT và MP4 đã chọn được cập nhật
+3. Bấm **Crop frame và nhãn**. Toàn bộ frame và XML/TXT được cập nhật
    dưới tên hiện tại. Chỉ giữ box nằm trọn trong vùng; box ngoài vùng hoặc bị cắt
    dù chỉ một phần đều bị xoá toàn bộ. Box vừa sát biên nhưng không vượt biên vẫn giữ.
    Box nhỏ còn nằm trọn trong vùng vẫn giữ nhãn. Nhãn đang sửa chưa Ctrl+S cũng
@@ -264,12 +260,12 @@ Bấm **➕ Thêm bộ frame từ thư mục...** ở cột trái, chọn thư m
 Box bị cắt sẽ mất nhãn dù còn thấy một phần người ở mép ảnh; nên chọn biên crop
 tránh cắt ngang người khi có thể.
 
-MP4 cần FFmpeg trong PATH, giữ FPS và âm thanh nếu có; kích thước xuất khớp frame crop.
-Ảnh không resize; chiều rộng/cao vùng được làm tròn xuống số chẵn để xuất MP4.
+Video nguồn luôn được giữ nguyên; không cần chọn MP4 hoặc cài FFmpeg để crop frame.
+Ảnh không resize; chiều rộng/cao vùng vẫn được làm tròn xuống số chẵn như trước.
 Khi thành công, tool nạp lại đúng clip và vị trí frame đang xem.
 
 Bản trước crop được lưu tại `_crop_backups/<clip>/<thời_điểm>/`, gồm `frames`, `xml`,
-`txt`, `log` nếu trước đó có, cùng `video.mp4` nếu cắt video. `backup.json` ghi đường
+`txt`, `log` nếu trước đó có. `backup.json` ghi đường
 dẫn gốc; `annotations_before_crop.xml` còn giữ cả nhãn trong bộ nhớ trước khi cắt.
 Backup nằm ngoài thư mục frame/ảnh được export để train. Nếu xử lý lỗi trước khi
 hoàn tất, tool khôi phục dữ liệu hiện tại từ backup.

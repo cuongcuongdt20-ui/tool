@@ -14,7 +14,7 @@ class CropProgressDialog:
         self.messages = queue.Queue()
         self.on_complete = on_complete
         self.window = tk.Toplevel(parent)
-        self.window.title("Đang crop và thay thế clip")
+        self.window.title("Đang crop frame và nhãn")
         self.window.configure(bg="#1e293b")
         self.window.transient(parent)
         self.window.resizable(False, False)
@@ -64,7 +64,7 @@ class CropProgressDialog:
                 messagebox.showerror("Không crop được clip", str(value))
             return
         if last:
-            done, total, stage = last
+            done, total, _stage = last
             self.progress["value"] = done / max(1, total) * 100
-            self.status.set(f"Đang crop frame: {done}/{total}" if stage == "frames" else "Đang crop MP4 và giữ âm thanh…")
+            self.status.set(f"Đang crop frame: {done}/{total}")
         self.window.after(100, self.poll)

@@ -1,8 +1,6 @@
 import hashlib
 import json
 from pathlib import Path
-import shutil
-import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -140,7 +138,7 @@ class ClipCropTest(unittest.TestCase):
         log = json.loads((self.root / "extract_logs" / "original.json").read_text())
         self.assertEqual(log["frame_mapping"], [["B.png", "B.png"], ["a.png", "a.png"]])
 
-    def test_reject_paths_and_normalize_encoder_dimensions(self):
+    def test_reject_paths_and_normalize_dimensions(self):
         for name in ("../outside", "..", "C:\\outside", ""):
             with self.assertRaises(ValueError):
                 crop_labeled_clip(self.root, "original", name, self.annotations, self.roi)
@@ -167,51 +165,30 @@ class ClipCropTest(unittest.TestCase):
         self.assertFalse(list(self.root.glob(".crop-*")))
         self.assert_preserved(original)
 
-    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg required")
-    def test_bad_source_video_leaves_no_outputs(self):
-        video = self.root / "bad.mp4"
-        video.write_bytes(b"not a video")
-        original = self.snapshot()
-        with self.assertRaises(RuntimeError):
-            crop_labeled_clip(self.root, "original", "bad_video", self.annotations, self.roi, video_path=video)
-        self.assertFalse((self.root / "frames" / "bad_video").exists())
-        self.assertFalse((self.root / "videos" / "bad_video.mp4").exists())
-        self.assertFalse(list(self.root.glob(".crop-*")))
-        self.assert_preserved(original)
+    def test_crop_preserves_linked_source_and_local_videos(self):
+        source = self.root / "demo" / "source.mp4"
+        local = self.root / "videos" / "original.mp4"
+        for video in (source, local):
+            video.parent.mkdir(parents=True, exist_ok=True)
+            video.write_bytes(b"original video bytes: " + video.name.encode())
+        log = self.root / "extract_logs" / "original.json"
+        log.parent.mkdir()
+        log.write_text(json.dumps(dict(source_video=str(source), current_video=str(local))))
+        video_hashes = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in (source, local)}
 
-    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg and ffprobe required")
-    def test_actual_video_crop_keeps_audio_fps_and_frame_count(self):
-        video = self.root / "source.mp4"
-        subprocess.run([shutil.which("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin",
-                        "-f", "lavfi", "-i", "testsrc=size=96x64:rate=10",
-                        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100", "-t", "0.2",
-                        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(video)],
-                       check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        original = self.snapshot()
-        result = crop_labeled_clip(self.root, "original", "movie", self.annotations, self.roi, video_path=video)
-        probe = json.loads(subprocess.check_output([shutil.which("ffprobe"), "-v", "error",
-                                                    "-show_streams", "-of", "json", result["video"]],
-                                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))
-        stream = next(s for s in probe["streams"] if s["codec_type"] == "video")
-        self.assertEqual((stream["width"], stream["height"]), (48, 40))
-        self.assertEqual(stream["avg_frame_rate"], "10/1")
-        self.assertEqual(int(stream["nb_frames"]), 2)
-        self.assertTrue(any(s["codec_type"] == "audio" for s in probe["streams"]))
-        self.assert_preserved(original)
-        previous_video = hashlib.sha256(video.read_bytes()).hexdigest()
-        replaced = crop_labeled_clip(self.root, "original", "original", self.annotations,
-                                     self.roi, video_path=video, replace=True)
-        self.assertEqual(Path(replaced["video"]), video)
-        self.assertEqual(json.loads((self.root / "extract_logs" / "original.json").read_text())["current_video"], str(video))
-        self.assertNotEqual(hashlib.sha256(video.read_bytes()).hexdigest(), previous_video)
-        self.assertEqual(hashlib.sha256((Path(replaced["backup"]) / "video.mp4").read_bytes()).hexdigest(), previous_video)
-        new_probe = json.loads(subprocess.check_output([shutil.which("ffprobe"), "-v", "error",
-                                                        "-show_streams", "-of", "json", str(video)],
-                                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))
-        new_video = next(s for s in new_probe["streams"] if s["codec_type"] == "video")
-        self.assertEqual((new_video["width"], new_video["height"]), (48, 40))
-        self.assertEqual(new_video["avg_frame_rate"], "10/1")
-        self.assertTrue(any(s["codec_type"] == "audio" for s in new_probe["streams"]))
+        # A frames-only crop must work even with no video encoder or decoder installed.
+        with patch.dict("os.environ", {"PATH": ""}):
+            result = crop_labeled_clip(self.root, "original", "original", self.annotations,
+                                       self.roi, replace=True)
+        self.assert_preserved(video_hashes)
+        with Image.open(self.frames / "000001.png") as image:
+            self.assertEqual(image.size, (48, 40))
+        current = parse_cvat_xml(str(self.root / "labels" / "original.xml"))
+        self.assertEqual([b["label"] for b in current["annotations"][0]], ["swim"])
+        self.assertEqual(json.loads(log.read_text())["crop_scope"], "frames_and_labels")
+        backup = Path(result["backup"])
+        self.assertFalse((backup / "video.mp4").exists())
+        self.assertEqual(json.loads((backup / "log").read_text())["source_video"], str(source))
 
 
 if __name__ == "__main__":
