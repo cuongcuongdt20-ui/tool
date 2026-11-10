@@ -5,6 +5,9 @@ import argparse
 import time
 import subprocess
 import threading
+import json
+import tempfile
+from pathlib import Path
 from collections import OrderedDict
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -27,6 +30,9 @@ from annotation_io import (
     save_yolo_txt
 )
 from zoom_canvas import ZoomPanView
+from crop_dialog import CropProgressDialog
+from clip_crop import crop_labeled_clip, normalize_crop_roi
+from sequence_delete import propose_box_sequence
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(BASE_DIR)  # archive/ is shared with the frame extractor
@@ -115,6 +121,13 @@ class DesktopFrameLabeler:
         self.current_pil = None
         self._cursor = "crosshair"
         self.show_swim_labels = tk.BooleanVar(master=self.root, value=False)
+        self.crop_mode = False
+        self.crop_roi = None
+        self._crop_drag = None
+        self._crop_has_selection = False
+        self._crop_resume_play = False
+        self.sequence_preview = None
+        self._sequence_anchor = None
 
         # Editing state
         self.drag = None
@@ -131,6 +144,7 @@ class DesktopFrameLabeler:
         self._slider_lock = False
         self._timeline_job = None
         self._import_running = False
+        self._crop_dialog = None
 
         self.create_ui()
         self.bind_shortcuts()
@@ -204,7 +218,7 @@ class DesktopFrameLabeler:
         # 2. CENTER CANVAS VIEWPORT
         center_frame = tk.Frame(self.root, bg="#0f172a")
         center_frame.grid(row=0, column=1, sticky="nsew", padx=5, pady=10)
-        center_frame.rowconfigure(1, weight=1)
+        center_frame.rowconfigure(2, weight=1)
         center_frame.columnconfigure(0, weight=1)
 
         top_bar = tk.Frame(center_frame, bg="#1e293b", height=50)
@@ -219,8 +233,50 @@ class DesktopFrameLabeler:
                          ("Vừa khung (F)", self.fit_view), ("Zoom box (Z)", self.zoom_to_selected)):
             tk.Button(zoom_box, text=txt, font=("Inter", 8), bg="#334155", fg="#f8fafc", relief="flat", padx=6, command=cmd).pack(side="left", padx=1)
 
+        self.crop_bar = tk.Frame(center_frame, bg="#1e293b")
+        self.crop_bar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        self.crop_bar.columnconfigure(1, weight=1)
+        self.crop_info = tk.StringVar(master=self.root)
+        tk.Label(self.crop_bar, textvariable=self.crop_info, bg="#1e293b", fg="#67e8f9",
+                 font=("Inter", 8)).grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=3)
+        tk.Button(self.crop_bar, text="Toàn khung", command=self.reset_crop_region).grid(row=0, column=2, padx=3)
+        self.crop_video_enabled = tk.BooleanVar(master=self.root, value=True)
+        tk.Checkbutton(self.crop_bar, text="Cắt cả MP4", variable=self.crop_video_enabled,
+                       bg="#1e293b", fg="#f8fafc", activebackground="#1e293b",
+                       activeforeground="#f8fafc", selectcolor="#334155").grid(row=1, column=0, padx=3)
+        self.crop_video_path = tk.StringVar(master=self.root)
+        tk.Entry(self.crop_bar, textvariable=self.crop_video_path, width=1, bg="#0f172a",
+                 fg="#f8fafc", insertbackground="#fff").grid(row=1, column=1, sticky="ew", padx=3)
+        tk.Button(self.crop_bar, text="Chọn MP4…", command=self.browse_crop_video).grid(row=1, column=2, padx=3)
+        tk.Button(self.crop_bar, text="Crop và thay thế clip", command=self.apply_clip_crop,
+                  bg="#0e7490", fg="#fff").grid(row=2, column=2, padx=3, pady=3)
+        tk.Label(self.crop_bar, text="Play/tua để xem vùng giữ lại. Ctrl+kéo để vẽ lại; Esc để thoát.\n"
+                 "Thay thế clip hiện tại; bản cũ lưu trong _crop_backups.\n"
+                 "Box bị cắt ở mép sẽ xoá toàn bộ nhãn.", justify="left",
+                 bg="#1e293b", fg="#94a3b8", font=("Inter", 7)).grid(row=2, column=0, columnspan=2,
+                                                                     sticky="w", padx=6, pady=3)
+        self.crop_bar.grid_remove()
+        self.sequence_bar = tk.Frame(center_frame, bg="#1e293b")
+        self.sequence_bar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        self.sequence_summary = tk.StringVar(master=self.root)
+        tk.Label(self.sequence_bar, textvariable=self.sequence_summary, bg="#1e293b", fg="#67e8f9",
+                 font=("Inter", 8), wraplength=550, justify="left").pack(anchor="w", padx=6, pady=3)
+        sequence_controls = tk.Frame(self.sequence_bar, bg="#1e293b")
+        sequence_controls.pack(fill="x", padx=6, pady=3)
+        tk.Label(sequence_controls, text="Đến frame:", bg="#1e293b", fg="#f8fafc").pack(side="left")
+        self.sequence_end = tk.IntVar(master=self.root, value=1)
+        self.sequence_end_input = tk.Spinbox(sequence_controls, from_=1, to=1, width=7,
+                                             textvariable=self.sequence_end)
+        self.sequence_end_input.pack(side="left", padx=4)
+        tk.Button(sequence_controls, text="Tìm lại", command=self.rebuild_sequence_preview).pack(side="left")
+        self.sequence_apply_button = tk.Button(sequence_controls, text="Xoá chuỗi đã xem",
+                                               command=self.apply_sequence_delete, bg="#b91c1c", fg="#fff")
+        self.sequence_apply_button.pack(side="right", padx=3)
+        self.sequence_end.trace_add("write", self.sequence_limit_changed)
+        tk.Button(sequence_controls, text="Huỷ", command=self.cancel_sequence_preview).pack(side="right", padx=3)
+        self.sequence_bar.grid_remove()
         canvas_card = tk.Frame(center_frame, bg="#020617", bd=1, relief="solid")
-        canvas_card.grid(row=1, column=0, sticky="nsew")
+        canvas_card.grid(row=2, column=0, sticky="nsew")
 
         self.canvas = tk.Canvas(canvas_card, bg="#020617", highlightthickness=0, cursor="crosshair", takefocus=1)
         self.canvas.pack(fill="both", expand=True)
@@ -271,6 +327,7 @@ class DesktopFrameLabeler:
             b.pack(fill="x", pady=2, ipady=3)
             return b
 
+        self.crop_button = action_btn("✂ Crop ngay trên video", self.open_clip_crop, bg="#0e7490", bold=True)
         action_btn("📋 Copy sang frame kế (C)", self.copy_boxes_to_next)
         action_btn("⚡ Nội suy tới keyframe kế (I)", self.interpolate_range)
         action_btn("⚡ Nội suy toàn clip (Shift+I)", self.interpolate_all)
@@ -279,6 +336,7 @@ class DesktopFrameLabeler:
         tk.Button(undo_row, text="↶ Undo (Ctrl+Z)", font=("Inter", 8), bg="#334155", fg="#fff", relief="flat", command=self.undo).pack(side="left", expand=True, fill="x", padx=(0, 2), ipady=3)
         tk.Button(undo_row, text="↷ Redo (Ctrl+Y)", font=("Inter", 8), bg="#334155", fg="#fff", relief="flat", command=self.redo).pack(side="right", expand=True, fill="x", padx=(2, 0), ipady=3)
         action_btn("🗑️ Xoá box đang chọn (Del)", self.delete_selected_box, bg="#ef4444")
+        action_btn("🗑 Xoá theo chuỗi…", self.open_sequence_delete, bg="#9f1239")
         action_btn("🧹 Xoá tất cả nhãn frame (X)", self.clear_current_frame_boxes, bg="#b91c1c", bold=True)
         save_btn = tk.Button(actions_frame, text="💾 Save Labels (Ctrl+S)", font=("Inter", 10, "bold"), bg="#10b981", fg="#fff", relief="flat", command=self.save_current_annotations)
         save_btn.pack(fill="x", pady=(8, 2), ipady=6)
@@ -333,6 +391,9 @@ class DesktopFrameLabeler:
             def handler(event):
                 # Don't hijack keys while the user is typing in an entry / combobox
                 if isinstance(self.root.focus_get(), (tk.Entry, ttk.Entry, tk.Spinbox)):
+                    if event.keysym == "Escape" and (self.crop_mode or self.sequence_preview is not None):
+                        self.escape_mode()
+                        return "break"
                     return None
                 fn()
                 return "break"
@@ -359,7 +420,7 @@ class DesktopFrameLabeler:
         bind(["<Key-f>", "<Key-F>"], self.fit_view)
         bind(["<Key-z>", "<Key-Z>"], self.zoom_to_selected)
         bind(["<Tab>"], self.select_next_box)
-        bind(["<Escape>"], self.deselect_box)
+        bind(["<Escape>"], self.escape_mode)
 
     # ================================================================== dataset
     def load_dataset(self):
@@ -440,6 +501,7 @@ class DesktopFrameLabeler:
         self.load_snippet(snippet_id)
 
     def load_snippet(self, snippet_id):
+        self.cancel_sequence_preview()
         frames_dir = os.path.join(self.archive_dir, "frames", snippet_id)
         if not os.path.isdir(frames_dir):
             messagebox.showerror("Error", f"Frames folder not found: {frames_dir}")
@@ -449,6 +511,8 @@ class DesktopFrameLabeler:
             messagebox.showerror("Error", f"Không có ảnh nào trong: {frames_dir}")
             return
 
+        if self.crop_mode:
+            self._set_crop_mode(False)
         self.stop_play()
         self.current_snippet = snippet_id
         self.frames_dir = frames_dir
@@ -543,6 +607,7 @@ class DesktopFrameLabeler:
 
     def draw_boxes(self):
         self.canvas.delete("box")
+        pending_index = self.sequence_preview["by_frame"].get(self.current_frame_idx) if self.sequence_preview else None
         for i, b in enumerate(self.annotations.get(self.current_frame_idx, [])):
             is_sel = (i == self.selected_box_idx)
             color = CLASS_COLORS.get(b["label"], "#ff00cc")
@@ -559,6 +624,12 @@ class DesktopFrameLabeler:
             if is_sel:
                 for px, py in self.handle_points(x1, y1, x2, y2).values():
                     self.canvas.create_rectangle(px - 4, py - 4, px + 4, py + 4, fill="#ffffff", outline=color, tags="box")
+            if i == pending_index:
+                self.canvas.create_rectangle(x1 - 2, y1 - 2, x2 + 2, y2 + 2, outline="#38bdf8",
+                                             width=4, dash=(6, 3), tags="box")
+                self.canvas.create_text(x1 + 3, y2 + 10, text="SẼ XOÁ", fill="#38bdf8",
+                                        font=("Inter", 8, "bold"), anchor="w", tags="box")
+        self.draw_crop_overlay()
 
     # ================================================================== mouse editing
     def hit_test(self, cx, cy):
@@ -587,6 +658,17 @@ class DesktopFrameLabeler:
         self.canvas.focus_set()
         if not self.current_snippet:
             return
+        if self.sequence_preview is not None:
+            self.stop_play()
+            return
+        if self.crop_mode:
+            self._crop_resume_play = self.is_playing
+            self.stop_play()
+            hit = self.crop_hit(event.x, event.y) if self._crop_has_selection else None
+            if event.state & 0x0004:
+                hit = None
+            self._crop_drag = dict(hit=hit, start=self.event_image_xy(event), original=self.crop_roi)
+            return
         self.stop_play()
         ix, iy = self.event_image_xy(event)
         force_draw = bool(event.state & 0x0004)  # Ctrl held
@@ -605,6 +687,9 @@ class DesktopFrameLabeler:
         self.update_boxes_listbox()
 
     def on_canvas_drag(self, event):
+        if self.crop_mode:
+            self.drag_crop_region(event)
+            return
         d = self.drag
         if not d:
             return
@@ -644,6 +729,13 @@ class DesktopFrameLabeler:
         self.show_cursor_info(ix, iy, extra=f"  box {x2 - x1:.0f}x{y2 - y1:.0f}")
 
     def on_canvas_release(self, event):
+        if self.crop_mode:
+            self.drag_crop_region(event)
+            self._crop_drag = None
+            if self._crop_resume_play:
+                self._crop_resume_play = False
+                self.toggle_play()
+            return
         d = self.drag
         if not d:
             return
@@ -677,6 +769,9 @@ class DesktopFrameLabeler:
     def on_canvas_motion(self, event):
         if not self.current_snippet:
             return
+        if self.crop_mode:
+            self.canvas.config(cursor=HANDLE_CURSORS.get(self.crop_hit(event.x, event.y), "crosshair"))
+            return
         if self.drag is None:
             _, handle = self.hit_test(event.x, event.y)
             cursor = HANDLE_CURSORS.get(handle, "crosshair")
@@ -706,6 +801,8 @@ class DesktopFrameLabeler:
 
     # ================================================================== box list / selection
     def set_class(self, cls):
+        if self.sequence_edit_blocked():
+            return
         self.active_class = cls
         if cls == "swim":
             self.swim_btn.config(bg=CLASS_COLORS["swim"], fg="#000", font=("Inter", 9, "bold"))
@@ -735,6 +832,8 @@ class DesktopFrameLabeler:
             self.boxes_listbox.selection_set(self.selected_box_idx)
 
     def on_box_select(self, event):
+        if self.sequence_preview is not None:
+            return
         sel = self.boxes_listbox.curselection()
         if not sel:
             return
@@ -743,6 +842,8 @@ class DesktopFrameLabeler:
         self.canvas.focus_set()
 
     def select_next_box(self):
+        if self.sequence_preview is not None:
+            return
         boxes = self.annotations.get(self.current_frame_idx, [])
         if boxes:
             self.selected_box_idx = (self.selected_box_idx + 1) % len(boxes)
@@ -755,7 +856,117 @@ class DesktopFrameLabeler:
         self.update_boxes_listbox()
 
     # ================================================================== edit commands
+    def escape_mode(self):
+        if self.sequence_preview is not None:
+            self.cancel_sequence_preview()
+        elif self.crop_mode:
+            self._set_crop_mode(False)
+        else:
+            self.deselect_box()
+
+    def sequence_edit_blocked(self):
+        if self.sequence_preview is None:
+            return False
+        self.set_status("Đang xem trước xoá chuỗi: bấm Xoá hoặc Huỷ trước khi sửa nhãn.", warn=True)
+        return True
+
+    def open_sequence_delete(self):
+        if self.sequence_preview is not None:
+            self.rebuild_sequence_preview()
+            return
+        if self.crop_mode:
+            self.set_status("Thoát chế độ crop rồi chọn box cần xoá theo chuỗi.", warn=True)
+            return
+        boxes = self.annotations.get(self.current_frame_idx, [])
+        if not self.current_snippet or not 0 <= self.selected_box_idx < len(boxes):
+            messagebox.showinfo("Xoá theo chuỗi", "Chọn một box trên ảnh hoặc trong danh sách trước.")
+            return
+        self.stop_play()
+        self.drag = None
+        self.canvas.delete("temp")
+        self._sequence_anchor = (self.current_frame_idx, self.selected_box_idx)
+        self.sequence_end_input.config(from_=self.current_frame_idx + 1, to=self.total_frames)
+        self.sequence_end.set(self.total_frames)
+        self.rebuild_sequence_preview()
+
+    def rebuild_sequence_preview(self):
+        if self._sequence_anchor is None:
+            return
+        start, index = self._sequence_anchor
+        try:
+            end = self.sequence_end.get() - 1
+            if not start <= end < self.total_frames:
+                raise ValueError(f"Frame cuối phải nằm trong {start + 1}–{self.total_frames}")
+            proposal = propose_box_sequence(self.annotations, start, index, end)
+        except (ValueError, tk.TclError) as error:
+            self.sequence_apply_button.config(state="disabled")
+            messagebox.showerror("Xoá theo chuỗi", str(error))
+            return
+        proposal["by_frame"] = dict(proposal["matches"])
+        proposal["requested_end"] = end
+        proposal["snapshot"] = self.snapshot(proposal["by_frame"])
+        self.sequence_preview = proposal
+        self.selected_box_idx = -1
+        self.sequence_bar.grid()
+        count = len(proposal["matches"])
+        last = proposal["matches"][-1][0]
+        stop = f"Dừng trước frame {proposal['stop_frame'] + 1}: " if proposal["stop_frame"] is not None else ""
+        method = "theo track_id" if proposal["mode"] == "track_id" else "gợi ý theo vị trí"
+        self.sequence_summary.set(f"{count} box, frame {start + 1}–{last + 1} ({method}). "
+                                  f"{stop}{proposal['reason']}. Play/tua để xem các box viền xanh đứt trước khi xoá.")
+        self.sequence_apply_button.config(text=f"Xoá {count} box đã xem", state="normal")
+        self.draw_boxes()
+        self.update_boxes_listbox()
+        self.set_status("Chưa xoá nhãn. Kiểm tra chuỗi box viền xanh; Esc/Huỷ để bỏ xem trước.")
+
+    def sequence_limit_changed(self, *_):
+        if self.sequence_preview is not None:
+            self.sequence_apply_button.config(state="disabled")
+            self.set_status("Giới hạn frame đã đổi: bấm Tìm lại và kiểm tra lại chuỗi trước khi xoá.", warn=True)
+
+    def cancel_sequence_preview(self, redraw=True):
+        if self.sequence_preview is None:
+            self._sequence_anchor = None
+            return
+        self.stop_play()
+        self.sequence_preview = None
+        self._sequence_anchor = None
+        self.sequence_bar.grid_remove()
+        self.selected_box_idx = -1
+        if redraw:
+            self.draw_boxes()
+            self.update_boxes_listbox()
+
+    def apply_sequence_delete(self):
+        proposal = self.sequence_preview
+        if proposal is None:
+            return
+        try:
+            if self.sequence_end.get() - 1 != proposal["requested_end"]:
+                self.set_status("Bấm Tìm lại để cập nhật khoảng frame trước khi xoá.", warn=True)
+                return
+        except tk.TclError:
+            self.set_status("Nhập frame cuối hợp lệ rồi bấm Tìm lại.", warn=True)
+            return
+        if any(self.annotations.get(frame, []) != boxes for frame, boxes in proposal["snapshot"].items()):
+            self.cancel_sequence_preview()
+            self.set_status("Nhãn đã thay đổi: chọn box và tìm lại chuỗi trước khi xoá.", warn=True)
+            return
+        self.stop_play()
+        snapshot = self.snapshot(proposal["by_frame"])
+        for frame, index in proposal["matches"]:
+            self.annotations[frame].pop(index)
+            if not self.annotations[frame]:
+                self.annotations.pop(frame)
+        count = len(proposal["matches"])
+        self.cancel_sequence_preview(redraw=False)
+        self.push_undo(snapshot)
+        self.after_edit()
+        self.set_status(f"Đã xoá {count} box theo chuỗi. Ctrl+Z hoàn tác cả chuỗi; Ctrl+S để lưu.")
+
     def delete_selected_box(self):
+        if self.sequence_edit_blocked():
+            return
         boxes = self.annotations.get(self.current_frame_idx, [])
         if 0 <= self.selected_box_idx < len(boxes):
             snap = self.snapshot([self.current_frame_idx])
@@ -767,6 +978,8 @@ class DesktopFrameLabeler:
             self.after_edit()
 
     def clear_current_frame_boxes(self):
+        if self.sequence_edit_blocked():
+            return
         if self.annotations.get(self.current_frame_idx):
             snap = self.snapshot([self.current_frame_idx])
             self.annotations.pop(self.current_frame_idx, None)
@@ -775,6 +988,8 @@ class DesktopFrameLabeler:
             self.after_edit()
 
     def copy_boxes_to_next(self):
+        if self.sequence_edit_blocked():
+            return
         boxes = self.annotations.get(self.current_frame_idx, [])
         if not boxes or self.current_frame_idx >= self.total_frames - 1:
             return
@@ -821,6 +1036,8 @@ class DesktopFrameLabeler:
         return steps - 1
 
     def interpolate_range(self):
+        if self.sequence_edit_blocked():
+            return
         cur = self.current_frame_idx
         if not self.annotations.get(cur):
             self.set_status("⚠ Vẽ box ở keyframe bắt đầu trước khi nội suy", warn=True)
@@ -839,6 +1056,8 @@ class DesktopFrameLabeler:
         self.set_status(f"⚡ Đã nội suy {n} frame ({cur + 1} → {end_idx + 1})")
 
     def interpolate_all(self):
+        if self.sequence_edit_blocked():
+            return
         keys = sorted(f for f, b in self.annotations.items() if b)
         gaps = [(a, b) for a, b in zip(keys, keys[1:]) if b - a > 1]
         if not gaps:
@@ -889,9 +1108,13 @@ class DesktopFrameLabeler:
         self.set_status(f"{name} ({len(src)} bước còn lại)")
 
     def undo(self):
+        if self.sequence_edit_blocked():
+            return
         self._undo_redo(self.undo_stack, self.redo_stack, "↶ Undo")
 
     def redo(self):
+        if self.sequence_edit_blocked():
+            return
         self._undo_redo(self.redo_stack, self.undo_stack, "↷ Redo")
 
     # ================================================================== timeline strip
@@ -1045,8 +1268,209 @@ class DesktopFrameLabeler:
         return True
 
     def on_close(self):
+        if self._crop_dialog is not None and self._crop_dialog.busy:
+            self._crop_dialog.close()
+            self.set_status("Đang huỷ cắt clip; đợi hoàn tất rồi đóng lại.", warn=True)
+            return
         if self.confirm_discard():
             self.root.destroy()
+
+    def open_clip_crop(self):
+        self.cancel_sequence_preview()
+        if self.crop_mode:
+            self._set_crop_mode(False)
+            return
+        if not self.current_snippet or self.current_pil is None:
+            messagebox.showinfo("Cắt clip", "Chọn một clip và frame để chọn vùng cắt trước.")
+            return
+        if self._import_running:
+            messagebox.showinfo("Cắt clip", "Đợi thao tác thêm frame hoàn tất trước khi cắt.")
+            return
+        if self._crop_dialog is not None and self._crop_dialog.busy:
+            return
+        self._set_crop_mode(True)
+
+    def _set_crop_mode(self, enabled):
+        self.crop_mode = enabled
+        self._crop_drag = None
+        self._crop_has_selection = False
+        self._crop_resume_play = False
+        self.selected_box_idx = -1
+        if enabled:
+            self.crop_roi = normalize_crop_roi((0, 0, self.img_w, self.img_h), self.img_w, self.img_h)
+            self.crop_video_path.set(self._known_crop_video())
+            self.crop_bar.grid()
+            self.crop_button.config(text="✂ Thoát chế độ crop")
+            self.set_status("Kéo trên video để chọn vùng giữ lại; Play/tua để kiểm tra trước khi áp dụng.")
+        else:
+            self.crop_roi = None
+            self.crop_bar.grid_remove()
+            self.crop_button.config(text="✂ Crop ngay trên video")
+            self.canvas.config(cursor="crosshair")
+        self.draw_boxes()
+
+    def _known_crop_video(self):
+        root = Path(self.archive_dir)
+        records = []
+        for metadata in (root / "extract_logs" / f"{self.current_snippet}.json",
+                         root / "audit" / f"{self.current_snippet}_extraction.json"):
+            try:
+                data = json.loads(metadata.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    continue
+                records.append(data)
+            except (OSError, ValueError, TypeError):
+                continue
+
+        def existing(path):
+            if not isinstance(path, str) or not path:
+                return ""
+            candidate = Path(path).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path(PROJECT_DIR).parent / candidate
+            return str(candidate.resolve()) if candidate.is_file() and candidate.suffix.lower() == ".mp4" else ""
+
+        for data in records:
+            if data.get("current_video"):
+                return existing(data["current_video"])
+        local = root / "videos" / f"{self.current_snippet}.mp4"
+        if local.is_file():
+            return str(local.resolve())
+        for data in records:
+            if linked := existing(data.get("source_video") or data.get("video")):
+                return linked
+        return ""
+
+    def _remember_crop_video(self, path):
+        if not self.current_snippet:
+            raise ValueError("Chưa chọn clip")
+        video = Path(path).expanduser().resolve()
+        if not video.is_file() or video.suffix.lower() != ".mp4":
+            raise ValueError("Đường dẫn phải trỏ tới file MP4 đang tồn tại")
+        root = Path(self.archive_dir).resolve()
+        metadata = root / "extract_logs" / f"{self.current_snippet}.json"
+        if not metadata.resolve().is_relative_to(root):
+            raise ValueError("Đường dẫn log nằm ngoài dataset")
+        data = json.loads(metadata.read_text(encoding="utf-8")) if metadata.is_file() else {}
+        if not isinstance(data, dict):
+            raise ValueError("Log hiện tại không hợp lệ, chưa lưu được liên kết video")
+        data.update(clip_name=self.current_snippet, current_video=str(video))
+        if not data.get("source_video") and not data.get("video"):
+            data["source_video"] = str(video)
+        metadata.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=metadata.parent,
+                                             prefix=".video-source-", suffix=".json", delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump(data, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+            os.replace(temporary, metadata)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def browse_crop_video(self):
+        path = filedialog.askopenfilename(parent=self.root, title="Chọn MP4 của clip hiện tại để crop và thay thế",
+                                         filetypes=[("MP4", "*.mp4")])
+        if path:
+            self.crop_video_path.set(path)
+            try:
+                self._remember_crop_video(path)
+            except (OSError, ValueError) as error:
+                self.set_status(f"Đã chọn MP4, nhưng chưa lưu được liên kết: {error}", warn=True)
+
+    def reset_crop_region(self):
+        self.crop_roi = normalize_crop_roi((0, 0, self.img_w, self.img_h), self.img_w, self.img_h)
+        self._crop_has_selection = False
+        self.draw_boxes()
+
+    def crop_hit(self, cx, cy):
+        if not self.crop_roi:
+            return None
+        x, y, w, h = self.crop_roi
+        left, top = self.view.to_canvas(x, y)
+        right, bottom = self.view.to_canvas(x + w, y + h)
+        for name, (px, py) in self.handle_points(left, top, right, bottom).items():
+            if abs(cx - px) <= HANDLE_PX and abs(cy - py) <= HANDLE_PX:
+                return name
+        return "move" if left <= cx <= right and top <= cy <= bottom else None
+
+    def drag_crop_region(self, event):
+        if not self._crop_drag:
+            return
+        ix, iy = self.event_image_xy(event)
+        sx, sy = self._crop_drag["start"]
+        x, y, w, h = self._crop_drag["original"]
+        hit = self._crop_drag["hit"]
+        if hit == "move":
+            roi = (max(0, min(self.img_w - w, x + ix - sx)),
+                   max(0, min(self.img_h - h, y + iy - sy)), w, h)
+        else:
+            if hit:
+                left, right = (ix if "w" in hit else x), (ix if "e" in hit else x + w)
+                top, bottom = (iy if "n" in hit else y), (iy if "s" in hit else y + h)
+            else:
+                left, right, top, bottom = sx, ix, sy, iy
+            roi = (min(left, right), min(top, bottom), abs(right - left), abs(bottom - top))
+        try:
+            self.crop_roi = normalize_crop_roi(roi, self.img_w, self.img_h)
+        except ValueError:
+            return
+        self._crop_has_selection = True
+        self.draw_boxes()
+
+    def draw_crop_overlay(self):
+        self.canvas.delete("crop")
+        if not self.crop_mode or not self.crop_roi:
+            return
+        x, y, w, h = self.crop_roi
+        left, top = self.view.to_canvas(x, y)
+        right, bottom = self.view.to_canvas(x + w, y + h)
+        cw, ch = self.view.canvas_size()
+        for rect in ((0, 0, cw, top), (0, bottom, cw, ch), (0, top, left, bottom), (right, top, cw, bottom)):
+            self.canvas.create_rectangle(*rect, fill="#000", stipple="gray50", outline="", tags="crop")
+        self.canvas.create_rectangle(left, top, right, bottom, outline="#06b6d4", width=3, tags="crop")
+        for px, py in self.handle_points(left, top, right, bottom).values():
+            self.canvas.create_rectangle(px - 4, py - 4, px + 4, py + 4, fill="#06b6d4", outline="#fff", tags="crop")
+        self.crop_info.set(f"Giữ x={x}, y={y}, rộng={w}, cao={h} • áp dụng toàn clip")
+
+    def apply_clip_crop(self):
+        if not self.crop_mode or not self._crop_has_selection:
+            self.set_status("Kéo trên video để chọn vùng crop trước.", warn=True)
+            return
+        if self._crop_dialog is not None and self._crop_dialog.busy:
+            return
+        self.stop_play()
+        video = self.crop_video_path.get().strip() if self.crop_video_enabled.get() else None
+        if self.crop_video_enabled.get() and not video:
+            video = self._known_crop_video()
+            self.crop_video_path.set(video)
+        if self.crop_video_enabled.get() and not video:
+            self.browse_crop_video()
+            video = self.crop_video_path.get().strip()
+            if not video:
+                return
+        clip, frame = self.current_snippet, self.current_frame_idx
+        dataset, roi, annotations = self.archive_dir, self.crop_roi, copy.deepcopy(self.annotations)
+
+        def complete(result):
+            self._crop_dialog = None
+            self.set_dirty(False)
+            self._set_crop_mode(False)
+            self.cache.clear()
+            self.load_dataset()
+            self.switch_tab("all")
+            self.load_snippet(clip)
+            self.load_frame(min(frame, self.total_frames - 1))
+            self.render_snippet_list()
+            self.set_status(f"✂ Đã thay thế {clip}: giữ {result['kept']}, bỏ {result['removed']} box. Backup: {result['backup']}")
+
+        self._crop_dialog = CropProgressDialog(
+            self.root,
+            lambda progress, cancelled: crop_labeled_clip(dataset, clip, clip, annotations, roi,
+                                                         video_path=video, progress=progress,
+                                                         cancelled=cancelled, replace=True), complete)
 
     # ================================================================== delete clip
     def on_snippet_right_click(self, event):
@@ -1145,6 +1569,9 @@ class DesktopFrameLabeler:
 
     def close_snippet(self):
         """Unload the current clip (used before deleting it)."""
+        self.cancel_sequence_preview()
+        if self.crop_mode:
+            self._set_crop_mode(False)
         self.stop_play()
         self.current_snippet = None
         self.frames_dir = None
