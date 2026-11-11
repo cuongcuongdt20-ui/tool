@@ -236,6 +236,7 @@ Labeler không lưu điểm tin cậy nên không có phần trăm để hiển 
 - Dataset này không có file `.csv` chia tập, nên labeler quét trực tiếp `frames/`: clip chưa có `labels/<clip>.xml` nằm ở tab **Unlabeled**, tab **All Clips** gồm cả clip đã có nhãn.
 - `Ctrl + S` chỉ ghi `dataset_lifeguard/labels/<clip>.xml` (CVAT XML 1.1, class `swim` / `drown`, `id` bắt đầu từ 0), cùng định dạng với các file nhãn có sẵn trong repo. Không tạo YOLO TXT.
 - Đổi dataset: bấm **📁** cạnh nút 🔄 và chọn thư mục chứa `frames/`, hoặc chạy `python labeler/desktop_labeler.py --dataset archive`.
+- Chọn lại cùng thư mục vẫn quét lại clip, xoá ô tìm kiếm và chuyển sang danh sách tất cả. Nếu chưa mở clip nào, tool mở clip đầu tiên; các chỉnh sửa chưa lưu trong clip hiện tại vẫn được giữ.
 
 ### Thêm một bộ frame có sẵn (từ thư mục ảnh)
 Bấm **➕ Thêm bộ frame từ thư mục...** ở cột trái, chọn thư mục chứa ảnh (`.jpg/.jpeg/.png/.bmp/.webp`), đặt tên clip và chọn tập (`unlabeled` / `train` / `valid` / `test`).

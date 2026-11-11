@@ -441,11 +441,17 @@ class DesktopFrameLabeler:
         if not os.path.isdir(os.path.join(folder, "frames")):
             messagebox.showerror("Chọn dataset", f"Không có thư mục frames/ trong:\n{folder}")
             return
-        if folder == self.archive_dir or not self.confirm_discard():
-            return
-        self.close_snippet()
-        self.archive_dir = folder
+        if folder != self.archive_dir:
+            if not self.confirm_discard():
+                return
+            self.close_snippet()
+            self.archive_dir = folder
+        self.search_entry.delete(0, tk.END)
         self.load_dataset()
+        self.switch_tab("all")
+        if self.current_snippet is None and self.filtered_snippets:
+            self.load_snippet(self.filtered_snippets[0]["snippet_id"])
+            self.render_snippet_list()
         self.set_status(f"Đã mở dataset {self.short_path(folder)}: {len(self.snippets)} clip")
 
     def update_stats(self):
